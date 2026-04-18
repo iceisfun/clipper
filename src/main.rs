@@ -1,7 +1,10 @@
 mod storage;
 
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
+use iced::keyboard;
 use iced::widget::image::Handle;
-use iced::widget::operation::scroll_to;
+use iced::widget::operation::{focus, scroll_to};
 use iced::widget::scrollable::AbsoluteOffset;
 use iced::widget::{
     button, column, container, image as image_widget, row, scrollable, text, text_input, toggler,
@@ -26,6 +29,7 @@ use std::time::Duration;
 use storage::{LoadedState, Settings, Storage};
 
 const CONTENT_SCROLL_ID: iced::widget::Id = iced::widget::Id::new("content");
+const SEARCH_INPUT_ID: iced::widget::Id = iced::widget::Id::new("search");
 const POLL_INTERVAL_MIN_MS: u32 = 100;
 const POLL_INTERVAL_MAX_MS: u32 = 10_000;
 
@@ -146,6 +150,8 @@ struct Clipper {
     settings_open: bool,
     settings_draft_history_size: String,
     settings_draft_poll_interval_ms: String,
+    search_active: bool,
+    search_query: String,
     main_window: Option<window::Id>,
     focus_rx: Option<Receiver<()>>,
 }
@@ -163,6 +169,8 @@ enum Message {
     SettingsDeleteAll,
     SettingsSave,
     WindowOpened(window::Id),
+    Key(keyboard::Event),
+    SearchChanged(String),
 }
 
 impl Clipper {
@@ -236,6 +244,8 @@ impl Clipper {
             settings_open: false,
             settings_draft_history_size: draft_history,
             settings_draft_poll_interval_ms: draft_poll,
+            search_active: false,
+            search_query: String::new(),
             main_window: None,
             focus_rx,
         }
@@ -279,6 +289,30 @@ impl Clipper {
                 if self.main_window.is_none() {
                     self.main_window = Some(id);
                 }
+                Task::none()
+            }
+            Message::Key(event) => {
+                if let keyboard::Event::KeyPressed {
+                    key, modifiers, ..
+                } = event
+                {
+                    if modifiers.control() {
+                        if let keyboard::Key::Character(c) = &key {
+                            if c.as_str().eq_ignore_ascii_case("f") {
+                                return self.toggle_search();
+                            }
+                        }
+                    }
+                    if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                        && self.search_active
+                    {
+                        self.close_search();
+                    }
+                }
+                Task::none()
+            }
+            Message::SearchChanged(q) => {
+                self.search_query = q;
                 Task::none()
             }
             Message::ToggleSettings => {
@@ -353,6 +387,7 @@ impl Clipper {
         Subscription::batch([
             time::every(interval).map(|_| Message::Tick),
             window::open_events().map(Message::WindowOpened),
+            keyboard::listen().map(Message::Key),
         ])
     }
 
@@ -531,6 +566,44 @@ impl Clipper {
         self.clips.iter().map(|c| c.id).collect()
     }
 
+    fn toggle_search(&mut self) -> Task<Message> {
+        if self.search_active {
+            self.close_search();
+            Task::none()
+        } else {
+            self.search_active = true;
+            focus(SEARCH_INPUT_ID.clone())
+        }
+    }
+
+    fn close_search(&mut self) {
+        self.search_active = false;
+        self.search_query.clear();
+    }
+
+    fn filtered_clips(&self) -> Vec<&Clip> {
+        let q = self.search_query.trim();
+        if !self.search_active || q.is_empty() {
+            return self.clips.iter().collect();
+        }
+        let matcher = SkimMatcherV2::default();
+        let mut scored: Vec<(i64, &Clip)> = self
+            .clips
+            .iter()
+            .filter_map(|c| {
+                let haystack: Cow<'_, str> = match &c.data {
+                    ClipData::Text(t) => Cow::Borrowed(t.as_str()),
+                    ClipData::Image { width, height, .. } => {
+                        Cow::Owned(format!("image {}x{}", width, height))
+                    }
+                };
+                matcher.fuzzy_match(&haystack, q).map(|s| (s, c))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.into_iter().map(|(_, c)| c).collect()
+    }
+
     fn storage_if_enabled(&self) -> Option<&Storage> {
         if self.settings.storage_enabled {
             self.storage.as_ref()
@@ -615,27 +688,54 @@ impl Clipper {
             ..container::Style::default()
         });
 
-        let list_items = self.clips.iter().fold(column![].spacing(4), |col, clip| {
+        let filtered = self.filtered_clips();
+        let list_items = filtered.iter().fold(column![].spacing(4), |col, clip| {
             let selected = self.selected == Some(clip.id);
             col.push(clip_row(clip.id, &clip.preview, selected))
         });
 
-        let list_panel = container(
+        let mut list_column = column![].spacing(0);
+        if self.search_active {
+            let search_input = text_input("Search…", &self.search_query)
+                .id(SEARCH_INPUT_ID.clone())
+                .on_input(Message::SearchChanged)
+                .padding(8)
+                .size(14);
+            list_column = list_column.push(
+                container(search_input)
+                    .padding(8)
+                    .width(Fill)
+                    .style(|_: &Theme| container::Style {
+                        background: Some(Background::Color(Color::from_rgb8(
+                            0x1a, 0x1c, 0x22,
+                        ))),
+                        border: Border {
+                            color: Color::from_rgb8(0x24, 0x27, 0x2f),
+                            width: 0.0,
+                            radius: 0.0.into(),
+                        },
+                        ..container::Style::default()
+                    }),
+            );
+        }
+        list_column = list_column.push(
             scrollable(container(list_items).padding(8))
                 .height(Fill)
                 .width(Fill),
-        )
-        .width(Length::Fixed(300.0))
-        .height(Fill)
-        .style(|_: &Theme| container::Style {
-            background: Some(Background::Color(Color::from_rgb8(0x16, 0x18, 0x1d))),
-            border: Border {
-                color: Color::from_rgb8(0x24, 0x27, 0x2f),
-                width: 1.0,
-                radius: 0.0.into(),
-            },
-            ..container::Style::default()
-        });
+        );
+
+        let list_panel = container(list_column)
+            .width(Length::Fixed(300.0))
+            .height(Fill)
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(Color::from_rgb8(0x16, 0x18, 0x1d))),
+                border: Border {
+                    color: Color::from_rgb8(0x24, 0x27, 0x2f),
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..container::Style::default()
+            });
 
         let right_panel: Element<'_, Message> = if self.settings_open {
             self.settings_view()
