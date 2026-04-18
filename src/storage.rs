@@ -40,6 +40,7 @@ pub enum ClipData {
 pub struct Settings {
     pub history_size: u32,
     pub storage_enabled: bool,
+    pub poll_interval_ms: u32,
 }
 
 impl Default for Settings {
@@ -47,6 +48,7 @@ impl Default for Settings {
         Self {
             history_size: 1000,
             storage_enabled: true,
+            poll_interval_ms: 500,
         }
     }
 }
@@ -248,9 +250,10 @@ fn decode_order(bytes: &[u8]) -> Option<Vec<u64>> {
 }
 
 fn encode_settings(s: &Settings) -> Vec<u8> {
-    let mut out = Vec::with_capacity(5);
+    let mut out = Vec::with_capacity(9);
     out.extend_from_slice(&s.history_size.to_le_bytes());
     out.push(if s.storage_enabled { 1 } else { 0 });
+    out.extend_from_slice(&s.poll_interval_ms.to_le_bytes());
     out
 }
 
@@ -258,10 +261,21 @@ fn decode_settings(bytes: &[u8]) -> Option<Settings> {
     if bytes.len() < 4 {
         return None;
     }
+    let defaults = Settings::default();
     let history_size = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
-    let storage_enabled = if bytes.len() >= 5 { bytes[4] != 0 } else { true };
+    let storage_enabled = if bytes.len() >= 5 {
+        bytes[4] != 0
+    } else {
+        defaults.storage_enabled
+    };
+    let poll_interval_ms = if bytes.len() >= 9 {
+        u32::from_le_bytes(bytes[5..9].try_into().ok()?)
+    } else {
+        defaults.poll_interval_ms
+    };
     Some(Settings {
         history_size,
         storage_enabled,
+        poll_interval_ms,
     })
 }

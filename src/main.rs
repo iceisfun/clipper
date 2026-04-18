@@ -25,8 +25,9 @@ use std::time::Duration;
 
 use storage::{LoadedState, Settings, Storage};
 
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CONTENT_SCROLL_ID: iced::widget::Id = iced::widget::Id::new("content");
+const POLL_INTERVAL_MIN_MS: u32 = 100;
+const POLL_INTERVAL_MAX_MS: u32 = 10_000;
 
 static FOCUS_RX: OnceLock<Mutex<Option<Receiver<()>>>> = OnceLock::new();
 
@@ -144,6 +145,7 @@ struct Clipper {
     storage: Option<Storage>,
     settings_open: bool,
     settings_draft_history_size: String,
+    settings_draft_poll_interval_ms: String,
     main_window: Option<window::Id>,
     focus_rx: Option<Receiver<()>>,
 }
@@ -156,6 +158,7 @@ enum Message {
     Tick,
     ToggleSettings,
     SettingsHistorySizeChanged(String),
+    SettingsPollIntervalChanged(String),
     SettingsDiskToggled(bool),
     SettingsDeleteAll,
     SettingsSave,
@@ -217,7 +220,8 @@ impl Clipper {
             .collect();
 
         let selected = clips.first().map(|c| c.id);
-        let draft = loaded.settings.history_size.to_string();
+        let draft_history = loaded.settings.history_size.to_string();
+        let draft_poll = loaded.settings.poll_interval_ms.to_string();
         let focus_rx = FOCUS_RX
             .get()
             .and_then(|m| m.lock().ok().and_then(|mut g| g.take()));
@@ -230,7 +234,8 @@ impl Clipper {
             settings: loaded.settings,
             storage,
             settings_open: false,
-            settings_draft_history_size: draft,
+            settings_draft_history_size: draft_history,
+            settings_draft_poll_interval_ms: draft_poll,
             main_window: None,
             focus_rx,
         }
@@ -281,11 +286,17 @@ impl Clipper {
                 if self.settings_open {
                     self.settings_draft_history_size =
                         self.settings.history_size.to_string();
+                    self.settings_draft_poll_interval_ms =
+                        self.settings.poll_interval_ms.to_string();
                 }
                 Task::none()
             }
             Message::SettingsHistorySizeChanged(value) => {
                 self.settings_draft_history_size = value;
+                Task::none()
+            }
+            Message::SettingsPollIntervalChanged(value) => {
+                self.settings_draft_poll_interval_ms = value;
                 Task::none()
             }
             Message::SettingsDiskToggled(enabled) => {
@@ -313,9 +324,13 @@ impl Clipper {
                     if n > 0 {
                         self.settings.history_size = n;
                         self.trim();
-                        self.persist_settings_and_order();
                     }
                 }
+                if let Ok(n) = self.settings_draft_poll_interval_ms.trim().parse::<u32>() {
+                    self.settings.poll_interval_ms =
+                        n.clamp(POLL_INTERVAL_MIN_MS, POLL_INTERVAL_MAX_MS);
+                }
+                self.persist_settings_and_order();
                 self.settings_open = false;
                 Task::none()
             }
@@ -334,8 +349,9 @@ impl Clipper {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        let interval = Duration::from_millis(self.settings.poll_interval_ms as u64);
         Subscription::batch([
-            time::every(POLL_INTERVAL).map(|_| Message::Tick),
+            time::every(interval).map(|_| Message::Tick),
             window::open_events().map(Message::WindowOpened),
         ])
     }
@@ -826,6 +842,30 @@ impl Clipper {
             .size(12)
             .color(Color::from_rgb8(0x7a, 0x80, 0x8e));
 
+        let poll_row = row![
+            text("Poll interval")
+                .size(14)
+                .color(Color::from_rgb8(0xc3, 0xc7, 0xd1))
+                .width(Length::Fixed(130.0)),
+            text_input("500", &self.settings_draft_poll_interval_ms)
+                .on_input(Message::SettingsPollIntervalChanged)
+                .padding(8)
+                .size(14)
+                .width(Length::Fixed(100.0)),
+            text("ms")
+                .size(13)
+                .color(Color::from_rgb8(0x7a, 0x80, 0x8e)),
+        ]
+        .align_y(alignment::Vertical::Center)
+        .spacing(8);
+
+        let poll_hint = text(format!(
+            "How often to read the clipboard ({}–{} ms).",
+            POLL_INTERVAL_MIN_MS, POLL_INTERVAL_MAX_MS
+        ))
+        .size(12)
+        .color(Color::from_rgb8(0x7a, 0x80, 0x8e));
+
         let disk_row = row![
             text("Persist to disk")
                 .size(14)
@@ -885,6 +925,10 @@ impl Clipper {
                     history_row,
                     Space::new().height(Length::Fixed(4.0)),
                     history_hint,
+                    Space::new().height(Length::Fixed(20.0)),
+                    poll_row,
+                    Space::new().height(Length::Fixed(4.0)),
+                    poll_hint,
                     Space::new().height(Length::Fixed(20.0)),
                     disk_row,
                     Space::new().height(Length::Fixed(4.0)),
