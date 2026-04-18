@@ -1,10 +1,14 @@
+mod storage;
+
 use iced::widget::image::Handle;
+use iced::widget::operation::scroll_to;
+use iced::widget::scrollable::AbsoluteOffset;
 use iced::widget::{
-    button, column, container, image as image_widget, row, scrollable, text, Space,
+    button, column, container, image as image_widget, row, scrollable, text, text_input, Space,
 };
 use iced::{
     alignment, time, window, Background, Border, Color, Element, Fill, Length, Shadow,
-    Subscription, Theme,
+    Subscription, Task, Theme,
 };
 use image::codecs::png::PngDecoder;
 use image::ImageDecoder;
@@ -14,8 +18,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
-const MAX_HISTORY: usize = 1000;
+use storage::{LoadedState, Settings, Storage};
+
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+const CONTENT_SCROLL_ID: iced::widget::Id = iced::widget::Id::new("content");
 
 fn main() -> iced::Result {
     let icon = load_window_icon()?;
@@ -71,6 +77,10 @@ struct Clipper {
     selected: Option<u64>,
     next_id: u64,
     last_clipboard_hash: Option<u64>,
+    settings: Settings,
+    storage: Option<Storage>,
+    settings_open: bool,
+    settings_draft_history_size: String,
 }
 
 #[derive(Debug, Clone)]
@@ -79,24 +89,128 @@ enum Message {
     Remove(u64),
     CopySelected,
     Tick,
+    ToggleSettings,
+    SettingsHistorySizeChanged(String),
+    SettingsSave,
 }
 
 impl Clipper {
     fn new() -> Self {
+        let (storage, loaded) = match Storage::open(&storage::default_db_path()) {
+            Ok(s) => {
+                let loaded = s.load().unwrap_or_default();
+                (Some(s), loaded)
+            }
+            Err(err) => {
+                eprintln!("clipper: failed to open storage: {err}");
+                (None, LoadedState::default())
+            }
+        };
+
+        let mut next_id = 0u64;
+        let clips: Vec<Clip> = loaded
+            .clips
+            .into_iter()
+            .map(|pc| {
+                if pc.id >= next_id {
+                    next_id = pc.id + 1;
+                }
+                let (preview, data, image_handle) = match pc.data {
+                    storage::ClipData::Text(t) => {
+                        let preview = preview_text(&t);
+                        (preview, ClipData::Text(t), None)
+                    }
+                    storage::ClipData::Image {
+                        width,
+                        height,
+                        rgba,
+                    } => {
+                        let preview = format!("image · {}×{}", width, height);
+                        let handle = Handle::from_rgba(width, height, rgba.clone());
+                        (
+                            preview,
+                            ClipData::Image {
+                                width,
+                                height,
+                                rgba: Arc::new(rgba),
+                            },
+                            Some(handle),
+                        )
+                    }
+                };
+                Clip {
+                    id: pc.id,
+                    data,
+                    hash: pc.hash,
+                    preview,
+                    image_handle,
+                }
+            })
+            .collect();
+
+        let selected = clips.first().map(|c| c.id);
+        let draft = loaded.settings.history_size.to_string();
+
         Self {
-            clips: Vec::new(),
-            selected: None,
-            next_id: 0,
+            clips,
+            selected,
+            next_id,
             last_clipboard_hash: None,
+            settings: loaded.settings,
+            storage,
+            settings_open: false,
+            settings_draft_history_size: draft,
         }
     }
 
-    fn update(&mut self, message: Message) {
+    fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Select(id) => self.selected = Some(id),
-            Message::Remove(id) => self.remove_clip(id),
-            Message::CopySelected => self.copy_selected(),
-            Message::Tick => self.poll_clipboard(),
+            Message::Select(id) => {
+                let changed = self.selected != Some(id);
+                self.selected = Some(id);
+                if changed {
+                    return scroll_to(
+                        CONTENT_SCROLL_ID.clone(),
+                        AbsoluteOffset { x: 0.0, y: 0.0 },
+                    );
+                }
+                Task::none()
+            }
+            Message::Remove(id) => {
+                self.remove_clip(id);
+                Task::none()
+            }
+            Message::CopySelected => {
+                self.copy_selected();
+                Task::none()
+            }
+            Message::Tick => {
+                self.poll_clipboard();
+                Task::none()
+            }
+            Message::ToggleSettings => {
+                self.settings_open = !self.settings_open;
+                if self.settings_open {
+                    self.settings_draft_history_size =
+                        self.settings.history_size.to_string();
+                }
+                Task::none()
+            }
+            Message::SettingsHistorySizeChanged(value) => {
+                self.settings_draft_history_size = value;
+                Task::none()
+            }
+            Message::SettingsSave => {
+                if let Ok(n) = self.settings_draft_history_size.trim().parse::<u32>() {
+                    if n > 0 {
+                        self.settings.history_size = n;
+                        self.trim();
+                        self.persist_settings_and_order();
+                    }
+                }
+                self.settings_open = false;
+                Task::none()
+            }
         }
     }
 
@@ -104,6 +218,10 @@ impl Clipper {
         self.clips.retain(|c| c.id != id);
         if self.selected == Some(id) {
             self.selected = self.clips.first().map(|c| c.id);
+        }
+        if let Some(s) = &self.storage {
+            let _ = s.delete_clip(id);
+            let _ = s.save_order(&self.order_vec());
         }
     }
 
@@ -145,10 +263,16 @@ impl Clipper {
     fn ingest_text(&mut self, txt: String, hash: u64) {
         if let Some(pos) = self.clips.iter().position(|c| c.hash == hash) {
             self.bump_to_top(pos);
+            if let Some(s) = &self.storage {
+                let _ = s.save_order(&self.order_vec());
+            }
             return;
         }
         let preview = preview_text(&txt);
         let id = self.alloc_id();
+        if let Some(s) = &self.storage {
+            let _ = s.save_clip(id, hash, &storage::ClipData::Text(txt.clone()));
+        }
         self.clips.insert(
             0,
             Clip {
@@ -163,17 +287,34 @@ impl Clipper {
             self.selected = Some(id);
         }
         self.trim();
+        if let Some(s) = &self.storage {
+            let _ = s.save_order(&self.order_vec());
+        }
     }
 
     fn ingest_image(&mut self, width: u32, height: u32, bytes: Vec<u8>, hash: u64) {
         if let Some(pos) = self.clips.iter().position(|c| c.hash == hash) {
             self.bump_to_top(pos);
+            if let Some(s) = &self.storage {
+                let _ = s.save_order(&self.order_vec());
+            }
             return;
+        }
+        let id = self.alloc_id();
+        if let Some(s) = &self.storage {
+            let _ = s.save_clip(
+                id,
+                hash,
+                &storage::ClipData::Image {
+                    width,
+                    height,
+                    rgba: bytes.clone(),
+                },
+            );
         }
         let rgba = Arc::new(bytes);
         let handle = Handle::from_rgba(width, height, (*rgba).clone());
         let preview = format!("image · {}×{}", width, height);
-        let id = self.alloc_id();
         self.clips.insert(
             0,
             Clip {
@@ -192,6 +333,9 @@ impl Clipper {
             self.selected = Some(id);
         }
         self.trim();
+        if let Some(s) = &self.storage {
+            let _ = s.save_order(&self.order_vec());
+        }
     }
 
     fn bump_to_top(&mut self, pos: usize) {
@@ -208,8 +352,16 @@ impl Clipper {
     }
 
     fn trim(&mut self) {
-        if self.clips.len() > MAX_HISTORY {
-            self.clips.truncate(MAX_HISTORY);
+        let max = self.settings.history_size as usize;
+        while self.clips.len() > max {
+            if let Some(clip) = self.clips.pop() {
+                if self.selected == Some(clip.id) {
+                    self.selected = self.clips.first().map(|c| c.id);
+                }
+                if let Some(s) = &self.storage {
+                    let _ = s.delete_clip(clip.id);
+                }
+            }
         }
     }
 
@@ -243,13 +395,61 @@ impl Clipper {
         }
         self.last_clipboard_hash = Some(hash);
         self.bump_to_top(pos);
+        if let Some(s) = &self.storage {
+            let _ = s.save_order(&self.order_vec());
+        }
+    }
+
+    fn order_vec(&self) -> Vec<u64> {
+        self.clips.iter().map(|c| c.id).collect()
+    }
+
+    fn persist_settings_and_order(&self) {
+        if let Some(s) = &self.storage {
+            let _ = s.save_settings(&self.settings);
+            let _ = s.save_order(&self.order_vec());
+        }
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let gear_btn = button(
+            container(
+                text("⚙")
+                    .size(18)
+                    .color(Color::from_rgb8(0xc3, 0xc7, 0xd1)),
+            )
+            .padding([4, 10]),
+        )
+        .padding(0)
+        .on_press(Message::ToggleSettings)
+        .style(|_theme: &Theme, status| {
+            let bg = match status {
+                button::Status::Hovered => Color::from_rgb8(0x2a, 0x2e, 0x38),
+                button::Status::Pressed => Color::from_rgb8(0x20, 0x24, 0x2c),
+                _ => Color::from_rgb8(0x22, 0x25, 0x2c),
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: Color::WHITE,
+                border: Border {
+                    color: Color::from_rgb8(0x2e, 0x33, 0x3e),
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                shadow: Shadow::default(),
+                ..button::Style::default()
+            }
+        });
+
         let header = container(
-            text("Clipper")
-                .size(22)
-                .color(Color::from_rgb8(0xe6, 0xe8, 0xef)),
+            row![
+                text("Clipper")
+                    .size(22)
+                    .color(Color::from_rgb8(0xe6, 0xe8, 0xef)),
+                Space::new().width(Fill),
+                gear_btn,
+            ]
+            .align_y(alignment::Vertical::Center),
         )
         .padding([14, 18])
         .width(Fill)
@@ -280,6 +480,17 @@ impl Clipper {
             ..container::Style::default()
         });
 
+        let right_panel: Element<'_, Message> = if self.settings_open {
+            self.settings_view()
+        } else {
+            self.content_panel()
+        };
+
+        let body = row![list_panel, right_panel].height(Fill);
+        column![header, body].width(Fill).height(Fill).into()
+    }
+
+    fn content_panel(&self) -> Element<'_, Message> {
         let selected_clip = self
             .selected
             .and_then(|id| self.clips.iter().find(|c| c.id == id));
@@ -294,6 +505,7 @@ impl Clipper {
                     )
                     .padding(4),
                 )
+                .id(CONTENT_SCROLL_ID.clone())
                 .width(Fill)
                 .height(Fill)
                 .into(),
@@ -308,6 +520,7 @@ impl Clipper {
                             .center_x(Fill)
                             .width(Fill),
                     )
+                    .id(CONTENT_SCROLL_ID.clone())
                     .width(Fill)
                     .height(Fill)
                     .into()
@@ -379,7 +592,7 @@ impl Clipper {
         .align_y(alignment::Vertical::Center)
         .spacing(10);
 
-        let content_panel = container(
+        container(
             column![
                 content_header,
                 Space::new().height(Length::Fixed(10.0)),
@@ -392,10 +605,107 @@ impl Clipper {
         .style(|_: &Theme| container::Style {
             background: Some(Background::Color(Color::from_rgb8(0x1d, 0x20, 0x27))),
             ..container::Style::default()
+        })
+        .into()
+    }
+
+    fn settings_view(&self) -> Element<'_, Message> {
+        let save_btn = button(
+            container(
+                text("Save")
+                    .size(13)
+                    .color(Color::from_rgb8(0xe6, 0xe8, 0xef)),
+            )
+            .padding([6, 14]),
+        )
+        .padding(0)
+        .on_press(Message::SettingsSave)
+        .style(|_theme: &Theme, status| {
+            let bg = match status {
+                button::Status::Hovered => Color::from_rgb8(0x3b, 0x5b, 0xa9),
+                button::Status::Pressed => Color::from_rgb8(0x30, 0x4a, 0x90),
+                _ => Color::from_rgb8(0x2b, 0x36, 0x55),
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: Color::WHITE,
+                border: Border {
+                    color: Color::from_rgb8(0x5c, 0x82, 0xd6),
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                shadow: Shadow::default(),
+                ..button::Style::default()
+            }
         });
 
-        let body = row![list_panel, content_panel].height(Fill);
-        column![header, body].width(Fill).height(Fill).into()
+        let cancel_btn = button(
+            container(
+                text("Cancel")
+                    .size(13)
+                    .color(Color::from_rgb8(0xc3, 0xc7, 0xd1)),
+            )
+            .padding([6, 14]),
+        )
+        .padding(0)
+        .on_press(Message::ToggleSettings)
+        .style(|_theme: &Theme, status| {
+            let bg = match status {
+                button::Status::Hovered => Color::from_rgb8(0x2a, 0x2e, 0x38),
+                _ => Color::from_rgb8(0x22, 0x25, 0x2c),
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: Color::WHITE,
+                border: Border {
+                    color: Color::from_rgb8(0x2e, 0x33, 0x3e),
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                shadow: Shadow::default(),
+                ..button::Style::default()
+            }
+        });
+
+        let history_row = row![
+            text("History size")
+                .size(14)
+                .color(Color::from_rgb8(0xc3, 0xc7, 0xd1))
+                .width(Length::Fixed(130.0)),
+            text_input("1000", &self.settings_draft_history_size)
+                .on_input(Message::SettingsHistorySizeChanged)
+                .padding(8)
+                .size(14)
+                .width(Length::Fixed(140.0)),
+        ]
+        .align_y(alignment::Vertical::Center)
+        .spacing(10);
+
+        let hint = text("Max number of clips to keep in history.")
+            .size(12)
+            .color(Color::from_rgb8(0x7a, 0x80, 0x8e));
+
+        container(
+            column![
+                text("Settings")
+                    .size(18)
+                    .color(Color::from_rgb8(0xe6, 0xe8, 0xef)),
+                Space::new().height(Length::Fixed(18.0)),
+                history_row,
+                Space::new().height(Length::Fixed(4.0)),
+                hint,
+                Space::new().height(Length::Fixed(24.0)),
+                row![save_btn, cancel_btn].spacing(10),
+            ]
+            .padding(24),
+        )
+        .width(Fill)
+        .height(Fill)
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(Color::from_rgb8(0x1d, 0x20, 0x27))),
+            ..container::Style::default()
+        })
+        .into()
     }
 }
 
@@ -478,9 +788,6 @@ fn clip_row(id: u64, preview: &str, selected: bool) -> Element<'_, Message> {
 }
 
 fn fix_zero_alpha(rgba: &mut [u8]) {
-    // Some X11 clipboards deliver images with alpha=0 for every pixel,
-    // which renders as fully transparent. If every pixel is alpha=0,
-    // assume opaque and force alpha to 255.
     if rgba.chunks_exact(4).all(|p| p[3] == 0) {
         for p in rgba.chunks_exact_mut(4) {
             p[3] = 255;

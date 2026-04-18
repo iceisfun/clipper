@@ -7,3 +7,4 @@ edition = "2021"
 iced = { version = "0.14", features = ["advanced", "image", "tokio"] }
 arboard = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
+redb = "2"
