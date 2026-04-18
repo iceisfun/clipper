@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Clipper
+GenericName=Clipboard History
+Comment=Clipboard history with text and image support
+Exec=/home/iceisfun/work/clipper/target/release/clipper
+Icon=edit-paste
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+StartupWMClass=clipper

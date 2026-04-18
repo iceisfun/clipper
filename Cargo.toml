@@ -1,0 +1,8 @@
+[package]
+name = "clipper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iced = { version = "0.14", features = ["advanced", "image", "tokio"] }
+arboard = "3"
