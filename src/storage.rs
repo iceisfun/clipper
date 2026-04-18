@@ -39,12 +39,14 @@ pub enum ClipData {
 #[derive(Debug, Clone, Copy)]
 pub struct Settings {
     pub history_size: u32,
+    pub storage_enabled: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             history_size: 1000,
+            storage_enabled: true,
         }
     }
 }
@@ -118,6 +120,19 @@ impl Storage {
         {
             let mut table = write.open_table(META)?;
             table.insert(ORDER_KEY, encoded.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_all_clips(&self) -> Result<(), redb::Error> {
+        let write = self.db.begin_write()?;
+        write.delete_table(CLIPS)?;
+        {
+            let _ = write.open_table(CLIPS)?;
+            let mut meta = write.open_table(META)?;
+            let empty = encode_order(&[]);
+            meta.insert(ORDER_KEY, empty.as_slice())?;
         }
         write.commit()?;
         Ok(())
@@ -233,7 +248,10 @@ fn decode_order(bytes: &[u8]) -> Option<Vec<u64>> {
 }
 
 fn encode_settings(s: &Settings) -> Vec<u8> {
-    s.history_size.to_le_bytes().to_vec()
+    let mut out = Vec::with_capacity(5);
+    out.extend_from_slice(&s.history_size.to_le_bytes());
+    out.push(if s.storage_enabled { 1 } else { 0 });
+    out
 }
 
 fn decode_settings(bytes: &[u8]) -> Option<Settings> {
@@ -241,5 +259,9 @@ fn decode_settings(bytes: &[u8]) -> Option<Settings> {
         return None;
     }
     let history_size = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
-    Some(Settings { history_size })
+    let storage_enabled = if bytes.len() >= 5 { bytes[4] != 0 } else { true };
+    Some(Settings {
+        history_size,
+        storage_enabled,
+    })
 }

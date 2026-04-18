@@ -4,7 +4,8 @@ use iced::widget::image::Handle;
 use iced::widget::operation::scroll_to;
 use iced::widget::scrollable::AbsoluteOffset;
 use iced::widget::{
-    button, column, container, image as image_widget, row, scrollable, text, text_input, Space,
+    button, column, container, image as image_widget, row, scrollable, text, text_input, toggler,
+    Space,
 };
 use iced::{
     alignment, time, window, Background, Border, Color, Element, Fill, Length, Shadow,
@@ -155,6 +156,8 @@ enum Message {
     Tick,
     ToggleSettings,
     SettingsHistorySizeChanged(String),
+    SettingsDiskToggled(bool),
+    SettingsDeleteAll,
     SettingsSave,
     WindowOpened(window::Id),
 }
@@ -285,6 +288,26 @@ impl Clipper {
                 self.settings_draft_history_size = value;
                 Task::none()
             }
+            Message::SettingsDiskToggled(enabled) => {
+                let was_enabled = self.settings.storage_enabled;
+                self.settings.storage_enabled = enabled;
+                if let Some(s) = self.storage.as_ref() {
+                    let _ = s.save_settings(&self.settings);
+                }
+                if enabled && !was_enabled {
+                    self.flush_all_to_disk();
+                }
+                Task::none()
+            }
+            Message::SettingsDeleteAll => {
+                self.clips.clear();
+                self.selected = None;
+                self.last_clipboard_hash = None;
+                if let Some(s) = self.storage.as_ref() {
+                    let _ = s.delete_all_clips();
+                }
+                Task::none()
+            }
             Message::SettingsSave => {
                 if let Ok(n) = self.settings_draft_history_size.trim().parse::<u32>() {
                     if n > 0 {
@@ -304,7 +327,7 @@ impl Clipper {
         if self.selected == Some(id) {
             self.selected = self.clips.first().map(|c| c.id);
         }
-        if let Some(s) = &self.storage {
+        if let Some(s) = self.storage_if_enabled() {
             let _ = s.delete_clip(id);
             let _ = s.save_order(&self.order_vec());
         }
@@ -351,14 +374,14 @@ impl Clipper {
     fn ingest_text(&mut self, txt: String, hash: u64) {
         if let Some(pos) = self.clips.iter().position(|c| c.hash == hash) {
             self.bump_to_top(pos);
-            if let Some(s) = &self.storage {
+            if let Some(s) = self.storage_if_enabled() {
                 let _ = s.save_order(&self.order_vec());
             }
             return;
         }
         let preview = preview_text(&txt);
         let id = self.alloc_id();
-        if let Some(s) = &self.storage {
+        if let Some(s) = self.storage_if_enabled() {
             let _ = s.save_clip(id, hash, &storage::ClipData::Text(txt.clone()));
         }
         self.clips.insert(
@@ -375,7 +398,7 @@ impl Clipper {
             self.selected = Some(id);
         }
         self.trim();
-        if let Some(s) = &self.storage {
+        if let Some(s) = self.storage_if_enabled() {
             let _ = s.save_order(&self.order_vec());
         }
     }
@@ -383,13 +406,13 @@ impl Clipper {
     fn ingest_image(&mut self, width: u32, height: u32, bytes: Vec<u8>, hash: u64) {
         if let Some(pos) = self.clips.iter().position(|c| c.hash == hash) {
             self.bump_to_top(pos);
-            if let Some(s) = &self.storage {
+            if let Some(s) = self.storage_if_enabled() {
                 let _ = s.save_order(&self.order_vec());
             }
             return;
         }
         let id = self.alloc_id();
-        if let Some(s) = &self.storage {
+        if let Some(s) = self.storage_if_enabled() {
             let _ = s.save_clip(
                 id,
                 hash,
@@ -421,7 +444,7 @@ impl Clipper {
             self.selected = Some(id);
         }
         self.trim();
-        if let Some(s) = &self.storage {
+        if let Some(s) = self.storage_if_enabled() {
             let _ = s.save_order(&self.order_vec());
         }
     }
@@ -446,7 +469,7 @@ impl Clipper {
                 if self.selected == Some(clip.id) {
                     self.selected = self.clips.first().map(|c| c.id);
                 }
-                if let Some(s) = &self.storage {
+                if let Some(s) = self.storage_if_enabled() {
                     let _ = s.delete_clip(clip.id);
                 }
             }
@@ -483,7 +506,7 @@ impl Clipper {
         }
         self.last_clipboard_hash = Some(hash);
         self.bump_to_top(pos);
-        if let Some(s) = &self.storage {
+        if let Some(s) = self.storage_if_enabled() {
             let _ = s.save_order(&self.order_vec());
         }
     }
@@ -492,11 +515,41 @@ impl Clipper {
         self.clips.iter().map(|c| c.id).collect()
     }
 
+    fn storage_if_enabled(&self) -> Option<&Storage> {
+        if self.settings.storage_enabled {
+            self.storage.as_ref()
+        } else {
+            None
+        }
+    }
+
     fn persist_settings_and_order(&self) {
-        if let Some(s) = &self.storage {
+        if let Some(s) = self.storage.as_ref() {
             let _ = s.save_settings(&self.settings);
+        }
+        if let Some(s) = self.storage_if_enabled() {
             let _ = s.save_order(&self.order_vec());
         }
+    }
+
+    fn flush_all_to_disk(&self) {
+        let Some(s) = &self.storage else { return };
+        for clip in &self.clips {
+            let data = match &clip.data {
+                ClipData::Text(t) => storage::ClipData::Text(t.clone()),
+                ClipData::Image {
+                    width,
+                    height,
+                    rgba,
+                } => storage::ClipData::Image {
+                    width: *width,
+                    height: *height,
+                    rgba: (**rgba).clone(),
+                },
+            };
+            let _ = s.save_clip(clip.id, clip.hash, &data);
+        }
+        let _ = s.save_order(&self.order_vec());
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -769,23 +822,88 @@ impl Clipper {
         .align_y(alignment::Vertical::Center)
         .spacing(10);
 
-        let hint = text("Max number of clips to keep in history.")
+        let history_hint = text("Max number of clips to keep in history.")
+            .size(12)
+            .color(Color::from_rgb8(0x7a, 0x80, 0x8e));
+
+        let disk_row = row![
+            text("Persist to disk")
+                .size(14)
+                .color(Color::from_rgb8(0xc3, 0xc7, 0xd1))
+                .width(Length::Fixed(130.0)),
+            toggler(self.settings.storage_enabled)
+                .on_toggle(Message::SettingsDiskToggled)
+                .size(22),
+        ]
+        .align_y(alignment::Vertical::Center)
+        .spacing(10);
+
+        let disk_hint = text("Store clipboard history across restarts.")
+            .size(12)
+            .color(Color::from_rgb8(0x7a, 0x80, 0x8e));
+
+        let delete_all_btn = button(
+            container(
+                text("Delete All")
+                    .size(13)
+                    .color(Color::from_rgb8(0xff, 0xff, 0xff)),
+            )
+            .padding([6, 14]),
+        )
+        .padding(0)
+        .on_press(Message::SettingsDeleteAll)
+        .style(|_theme: &Theme, status| {
+            let bg = match status {
+                button::Status::Hovered => Color::from_rgb8(0xb5, 0x3a, 0x3a),
+                button::Status::Pressed => Color::from_rgb8(0x8f, 0x28, 0x28),
+                _ => Color::from_rgb8(0x7a, 0x2a, 0x2a),
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: Color::WHITE,
+                border: Border {
+                    color: Color::from_rgb8(0xd8, 0x5a, 0x5a),
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                shadow: Shadow::default(),
+                ..button::Style::default()
+            }
+        });
+
+        let delete_hint = text("Remove every clip from history (and disk).")
             .size(12)
             .color(Color::from_rgb8(0x7a, 0x80, 0x8e));
 
         container(
-            column![
-                text("Settings")
-                    .size(18)
-                    .color(Color::from_rgb8(0xe6, 0xe8, 0xef)),
-                Space::new().height(Length::Fixed(18.0)),
-                history_row,
-                Space::new().height(Length::Fixed(4.0)),
-                hint,
-                Space::new().height(Length::Fixed(24.0)),
-                row![save_btn, cancel_btn].spacing(10),
-            ]
-            .padding(24),
+            scrollable(
+                column![
+                    text("Settings")
+                        .size(18)
+                        .color(Color::from_rgb8(0xe6, 0xe8, 0xef)),
+                    Space::new().height(Length::Fixed(18.0)),
+                    history_row,
+                    Space::new().height(Length::Fixed(4.0)),
+                    history_hint,
+                    Space::new().height(Length::Fixed(20.0)),
+                    disk_row,
+                    Space::new().height(Length::Fixed(4.0)),
+                    disk_hint,
+                    Space::new().height(Length::Fixed(24.0)),
+                    row![save_btn, cancel_btn].spacing(10),
+                    Space::new().height(Length::Fixed(32.0)),
+                    text("Danger zone")
+                        .size(14)
+                        .color(Color::from_rgb8(0xd8, 0x5a, 0x5a)),
+                    Space::new().height(Length::Fixed(10.0)),
+                    delete_all_btn,
+                    Space::new().height(Length::Fixed(4.0)),
+                    delete_hint,
+                ]
+                .padding(24),
+            )
+            .width(Fill)
+            .height(Fill),
         )
         .width(Fill)
         .height(Fill)
