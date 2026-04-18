@@ -15,7 +15,11 @@ use image::ImageDecoder;
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use storage::{LoadedState, Settings, Storage};
@@ -23,7 +27,13 @@ use storage::{LoadedState, Settings, Storage};
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CONTENT_SCROLL_ID: iced::widget::Id = iced::widget::Id::new("content");
 
+static FOCUS_RX: OnceLock<Mutex<Option<Receiver<()>>>> = OnceLock::new();
+
 fn main() -> iced::Result {
+    if !setup_singleton() {
+        return Ok(());
+    }
+
     let icon = load_window_icon()?;
 
     iced::application(Clipper::new, Clipper::update, Clipper::view)
@@ -36,6 +46,58 @@ fn main() -> iced::Result {
             ..window::Settings::default()
         })
         .run()
+}
+
+fn socket_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(dir).join("clipper.sock");
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "default".to_string());
+    PathBuf::from(format!("/tmp/clipper-{user}.sock"))
+}
+
+/// Returns `true` if this process should proceed as the primary instance.
+/// Returns `false` if another instance is already running and was notified to focus.
+fn setup_singleton() -> bool {
+    let sock_path = socket_path();
+
+    if let Ok(mut stream) = UnixStream::connect(&sock_path) {
+        let _ = stream.write_all(b"focus\n");
+        let _ = stream.flush();
+        eprintln!("clipper: another instance is already running; requested focus");
+        return false;
+    }
+
+    let _ = std::fs::remove_file(&sock_path);
+
+    let listener = match UnixListener::bind(&sock_path) {
+        Ok(l) => l,
+        Err(err) => {
+            eprintln!(
+                "clipper: could not bind IPC socket at {:?}: {err}; continuing without singleton",
+                sock_path
+            );
+            return true;
+        }
+    };
+
+    let (tx, rx) = channel::<()>();
+    let _ = FOCUS_RX.set(Mutex::new(Some(rx)));
+
+    std::thread::spawn(move || loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let mut buf = [0u8; 16];
+                let _ = stream.read(&mut buf);
+                if tx.send(()).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    });
+
+    true
 }
 
 fn load_window_icon() -> Result<window::Icon, iced::Error> {
@@ -81,6 +143,8 @@ struct Clipper {
     storage: Option<Storage>,
     settings_open: bool,
     settings_draft_history_size: String,
+    main_window: Option<window::Id>,
+    focus_rx: Option<Receiver<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +156,7 @@ enum Message {
     ToggleSettings,
     SettingsHistorySizeChanged(String),
     SettingsSave,
+    WindowOpened(window::Id),
 }
 
 impl Clipper {
@@ -150,6 +215,9 @@ impl Clipper {
 
         let selected = clips.first().map(|c| c.id);
         let draft = loaded.settings.history_size.to_string();
+        let focus_rx = FOCUS_RX
+            .get()
+            .and_then(|m| m.lock().ok().and_then(|mut g| g.take()));
 
         Self {
             clips,
@@ -160,6 +228,8 @@ impl Clipper {
             storage,
             settings_open: false,
             settings_draft_history_size: draft,
+            main_window: None,
+            focus_rx,
         }
     }
 
@@ -186,6 +256,21 @@ impl Clipper {
             }
             Message::Tick => {
                 self.poll_clipboard();
+                if let (Some(rx), Some(id)) = (&self.focus_rx, self.main_window) {
+                    if rx.try_recv().is_ok() {
+                        while rx.try_recv().is_ok() {}
+                        return Task::batch([
+                            window::minimize(id, false),
+                            window::gain_focus(id),
+                        ]);
+                    }
+                }
+                Task::none()
+            }
+            Message::WindowOpened(id) => {
+                if self.main_window.is_none() {
+                    self.main_window = Some(id);
+                }
                 Task::none()
             }
             Message::ToggleSettings => {
@@ -226,7 +311,10 @@ impl Clipper {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        time::every(POLL_INTERVAL).map(|_| Message::Tick)
+        Subscription::batch([
+            time::every(POLL_INTERVAL).map(|_| Message::Tick),
+            window::open_events().map(Message::WindowOpened),
+        ])
     }
 
     fn theme(&self) -> Theme {
