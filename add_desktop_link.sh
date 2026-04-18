@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$SCRIPT_DIR/target/release/clipper"
+ICON="$SCRIPT_DIR/assets/clipper.png"
 TEMPLATE="$SCRIPT_DIR/clipper.desktop"
 DEST_DIR="$HOME/.local/share/applications"
 DEST="$DEST_DIR/clipper.desktop"
@@ -13,8 +14,13 @@ if [[ ! -x "$BIN" ]]; then
     exit 1
 fi
 
+if [[ ! -f "$ICON" ]]; then
+    echo "Icon not found at: $ICON"
+    exit 1
+fi
+
 mkdir -p "$DEST_DIR"
-sed "s|__CLIPPER_BIN__|$BIN|g" "$TEMPLATE" > "$DEST"
+sed -e "s|__CLIPPER_BIN__|$BIN|g" -e "s|__CLIPPER_ICON__|$ICON|g" "$TEMPLATE" > "$DEST"
 
 if command -v desktop-file-validate >/dev/null 2>&1; then
     desktop-file-validate "$DEST" || true

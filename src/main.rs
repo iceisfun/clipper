@@ -1,9 +1,13 @@
 use iced::widget::image::Handle;
-use iced::widget::{button, column, container, image, row, scrollable, text, Space};
-use iced::{
-    alignment, time, Background, Border, Color, Element, Fill, Length, Shadow, Subscription,
-    Theme,
+use iced::widget::{
+    button, column, container, image as image_widget, row, scrollable, text, Space,
 };
+use iced::{
+    alignment, time, window, Background, Border, Color, Element, Fill, Length, Shadow,
+    Subscription, Theme,
+};
+use image::codecs::png::PngDecoder;
+use image::ImageDecoder;
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -14,12 +18,33 @@ const MAX_HISTORY: usize = 1000;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 fn main() -> iced::Result {
+    let icon = load_window_icon()?;
+
     iced::application(Clipper::new, Clipper::update, Clipper::view)
         .title("Clipper — Clipboard History")
         .theme(Clipper::theme)
         .subscription(Clipper::subscription)
         .window_size((900.0, 560.0))
+        .window(window::Settings {
+            icon: Some(icon),
+            ..window::Settings::default()
+        })
         .run()
+}
+
+fn load_window_icon() -> Result<window::Icon, iced::Error> {
+    let png = include_bytes!("../assets/clipper.png");
+    let decoder = PngDecoder::new(std::io::Cursor::new(png))
+        .map_err(|err| iced::Error::WindowCreationFailed(Box::new(err)))?;
+    let (width, height) = decoder.dimensions();
+    let mut rgba = vec![0; decoder.total_bytes() as usize];
+
+    decoder
+        .read_image(&mut rgba)
+        .map_err(|err| iced::Error::WindowCreationFailed(Box::new(err)))?;
+
+    window::icon::from_rgba(rgba, width, height)
+        .map_err(|err| iced::Error::WindowCreationFailed(Box::new(err)))
 }
 
 #[derive(Debug, Clone)]
@@ -233,13 +258,10 @@ impl Clipper {
             ..container::Style::default()
         });
 
-        let list_items = self
-            .clips
-            .iter()
-            .fold(column![].spacing(4), |col, clip| {
-                let selected = self.selected == Some(clip.id);
-                col.push(clip_row(clip.id, &clip.preview, selected))
-            });
+        let list_items = self.clips.iter().fold(column![].spacing(4), |col, clip| {
+            let selected = self.selected == Some(clip.id);
+            col.push(clip_row(clip.id, &clip.preview, selected))
+        });
 
         let list_panel = container(
             scrollable(container(list_items).padding(8))
@@ -281,7 +303,7 @@ impl Clipper {
                         .clone()
                         .expect("image clip always has handle");
                     scrollable(
-                        container(image(handle))
+                        container(image_widget(handle))
                             .padding(4)
                             .center_x(Fill)
                             .width(Fill),
@@ -417,8 +439,7 @@ fn clip_row(id: u64, preview: &str, selected: bool) -> Element<'_, Message> {
         });
 
     let remove_btn = button(
-        container(text("×").size(18).color(Color::from_rgb8(0xd6, 0xd9, 0xe0)))
-            .padding([4, 10]),
+        container(text("×").size(18).color(Color::from_rgb8(0xd6, 0xd9, 0xe0))).padding([4, 10]),
     )
     .padding(0)
     .on_press(Message::Remove(id))
