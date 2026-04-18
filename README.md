@@ -14,7 +14,7 @@ re-copy anything back with one click.
 - `Copy` button writes the selected clip back to the system clipboard
 - `×` button per row removes an entry; clipboard-change tracking prevents it
   from immediately reappearing if the same content is still on the clipboard
-- Dark theme, 200-entry history cap
+- Dark theme, 1000-entry history cap
 
 ## Requirements
 
@@ -32,16 +32,14 @@ cargo run --release
 
 ```
 cargo build --release
-cp clipper.desktop ~/.local/share/applications/
-update-desktop-database ~/.local/share/applications/ 2>/dev/null
+./add_desktop_link.sh
 ```
+
+The script substitutes the absolute path to your built binary into
+`clipper.desktop` and installs it to `~/.local/share/applications/`.
 
 On GNOME/X11, press `Alt+F2` then `r` to restart the shell so the new entry
 appears in Activities. On Wayland, log out and back in.
-
-The shipped `clipper.desktop` points `Exec` at
-`/home/iceisfun/work/clipper/target/release/clipper` — edit that path if you
-clone the project elsewhere.
 
 ## Notes
 

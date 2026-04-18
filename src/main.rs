@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
-const MAX_HISTORY: usize = 200;
+const MAX_HISTORY: usize = 1000;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 fn main() -> iced::Result {
