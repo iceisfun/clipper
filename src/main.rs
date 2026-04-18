@@ -1060,11 +1060,14 @@ impl Clipper {
 }
 
 fn clip_row(id: u64, preview: &str, selected: bool) -> Element<'_, Message> {
-    let label = text(preview.to_string()).size(14).color(if selected {
-        Color::from_rgb8(0xff, 0xff, 0xff)
-    } else {
-        Color::from_rgb8(0xc3, 0xc7, 0xd1)
-    });
+    let label = text(preview.to_string())
+        .size(14)
+        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+        .color(if selected {
+            Color::from_rgb8(0xff, 0xff, 0xff)
+        } else {
+            Color::from_rgb8(0xc3, 0xc7, 0xd1)
+        });
 
     let select_btn = button(container(label).padding([8, 10]).width(Fill))
         .width(Fill)
