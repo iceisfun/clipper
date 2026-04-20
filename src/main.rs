@@ -52,6 +52,10 @@ fn main() -> iced::Result {
         .window_size((900.0, 560.0))
         .window(window::Settings {
             icon: Some(icon),
+            platform_specific: window::settings::PlatformSpecific {
+                application_id: "clipper".to_string(),
+                ..Default::default()
+            },
             ..window::Settings::default()
         })
         .run()
