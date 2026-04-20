@@ -9,3 +9,4 @@ arboard = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 redb = "2"
 fuzzy-matcher = "0.3"
+x11rb = { version = "0.13", features = ["screensaver"] }

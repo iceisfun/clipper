@@ -1,3 +1,4 @@
+mod idle;
 mod storage;
 
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -26,12 +27,14 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use idle::IdleMonitor;
 use storage::{LoadedState, Settings, Storage};
 
 const CONTENT_SCROLL_ID: iced::widget::Id = iced::widget::Id::new("content");
 const SEARCH_INPUT_ID: iced::widget::Id = iced::widget::Id::new("search");
 const POLL_INTERVAL_MIN_MS: u32 = 100;
 const POLL_INTERVAL_MAX_MS: u32 = 10_000;
+const IDLE_THRESHOLD_MS: u32 = 30_000;
 
 static FOCUS_RX: OnceLock<Mutex<Option<Receiver<()>>>> = OnceLock::new();
 
@@ -43,7 +46,7 @@ fn main() -> iced::Result {
     let icon = load_window_icon()?;
 
     iced::application(Clipper::new, Clipper::update, Clipper::view)
-        .title("Clipper — Clipboard History")
+        .title(Clipper::title)
         .theme(Clipper::theme)
         .subscription(Clipper::subscription)
         .window_size((900.0, 560.0))
@@ -154,6 +157,8 @@ struct Clipper {
     search_query: String,
     main_window: Option<window::Id>,
     focus_rx: Option<Receiver<()>>,
+    idle_monitor: Option<IdleMonitor>,
+    is_idle: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +253,8 @@ impl Clipper {
             search_query: String::new(),
             main_window: None,
             focus_rx,
+            idle_monitor: IdleMonitor::new(),
+            is_idle: false,
         }
     }
 
@@ -395,7 +402,32 @@ impl Clipper {
         Theme::Dark
     }
 
+    fn title(&self) -> String {
+        if self.is_idle {
+            "Clipper — Clipboard History (idle)".to_string()
+        } else {
+            "Clipper — Clipboard History".to_string()
+        }
+    }
+
     fn poll_clipboard(&mut self) {
+        if let Some(mon) = self.idle_monitor.as_ref() {
+            if let Some(ms) = mon.idle_ms() {
+                let idle_now = ms >= IDLE_THRESHOLD_MS;
+                if idle_now != self.is_idle {
+                    self.is_idle = idle_now;
+                    if idle_now {
+                        eprintln!("clipper: idle ({} ms) — pausing clipboard polling", ms);
+                    } else {
+                        eprintln!("clipper: active ({} ms) — resuming clipboard polling", ms);
+                    }
+                }
+                if idle_now {
+                    return;
+                }
+            }
+        }
+
         let Ok(mut cb) = arboard::Clipboard::new() else {
             return;
         };
