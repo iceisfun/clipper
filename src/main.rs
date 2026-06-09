@@ -6,14 +6,14 @@ use fuzzy_matcher::FuzzyMatcher;
 use iced::keyboard;
 use iced::widget::image::Handle;
 use iced::widget::operation::{focus, scroll_to};
-use iced::widget::scrollable::AbsoluteOffset;
+use iced::widget::scrollable::{AbsoluteOffset, Viewport};
 use iced::widget::{
     button, column, container, image as image_widget, row, scrollable, text, text_input, toggler,
     Space,
 };
 use iced::{
-    alignment, time, window, Background, Border, Color, Element, Fill, Length, Shadow,
-    Subscription, Task, Theme,
+    alignment, window, Background, Border, Color, Element, Fill, Length, Shadow, Subscription,
+    Task, Theme,
 };
 use image::codecs::png::PngDecoder;
 use image::ImageDecoder;
@@ -31,10 +31,16 @@ use idle::IdleMonitor;
 use storage::{LoadedState, Settings, Storage};
 
 const CONTENT_SCROLL_ID: iced::widget::Id = iced::widget::Id::new("content");
+const LIST_SCROLL_ID: iced::widget::Id = iced::widget::Id::new("list");
 const SEARCH_INPUT_ID: iced::widget::Id = iced::widget::Id::new("search");
 const POLL_INTERVAL_MIN_MS: u32 = 100;
 const POLL_INTERVAL_MAX_MS: u32 = 10_000;
 const IDLE_THRESHOLD_MS: u32 = 30_000;
+/// Fixed pixel height reserved per sidebar row. The list is virtualized against
+/// this stride, so it must match the actual rendered row height in `clip_row`.
+const LIST_ROW_STRIDE: f32 = 40.0;
+/// Extra rows rendered above/below the visible window to avoid blanks while scrolling.
+const LIST_OVERSCAN: usize = 6;
 
 static FOCUS_RX: OnceLock<Mutex<Option<Receiver<()>>>> = OnceLock::new();
 
@@ -113,6 +119,109 @@ fn setup_singleton() -> bool {
     true
 }
 
+/// Background clipboard poller. Runs on its own OS thread and only forwards a
+/// message when the clipboard content hash changes, so an idle session produces
+/// no messages — and therefore no UI redraws. Honors the X11 idle threshold and
+/// stops itself when the subscription is dropped (e.g. poll interval changed).
+fn clipboard_worker(interval_ms: &u64) -> impl iced::futures::Stream<Item = Message> {
+    let interval = Duration::from_millis((*interval_ms).max(POLL_INTERVAL_MIN_MS as u64));
+    iced::stream::channel(16, move |output: iced::futures::channel::mpsc::Sender<Message>| async move {
+        std::thread::spawn(move || {
+            let mut output = output;
+            let idle_monitor = IdleMonitor::new();
+            let mut clipboard = arboard::Clipboard::new().ok();
+            let mut last_hash: Option<u64> = None;
+            let mut last_idle: Option<bool> = None;
+
+            loop {
+                let idle_now = idle_monitor
+                    .as_ref()
+                    .and_then(|m| m.idle_ms())
+                    .map(|ms| ms >= IDLE_THRESHOLD_MS);
+
+                if let Some(idle) = idle_now {
+                    if last_idle != Some(idle) {
+                        match output.try_send(Message::IdleChanged(idle)) {
+                            Ok(()) => last_idle = Some(idle),
+                            Err(e) if e.is_disconnected() => return,
+                            Err(_) => {}
+                        }
+                    }
+                }
+
+                if !idle_now.unwrap_or(false) {
+                    if clipboard.is_none() {
+                        clipboard = arboard::Clipboard::new().ok();
+                    }
+                    if let Some(cb) = clipboard.as_mut() {
+                        if let Some((msg, hash)) = read_clipboard(cb) {
+                            if last_hash != Some(hash) {
+                                match output.try_send(msg) {
+                                    Ok(()) => last_hash = Some(hash),
+                                    Err(e) if e.is_disconnected() => return,
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+                    }
+                }
+
+                std::thread::sleep(interval);
+            }
+        });
+    })
+}
+
+/// Reads the current clipboard, returning a message plus its content hash, or
+/// `None` if the clipboard holds nothing we capture. Does not deduplicate — the
+/// caller compares the hash against the last value it forwarded.
+fn read_clipboard(cb: &mut arboard::Clipboard) -> Option<(Message, u64)> {
+    if let Ok(txt) = cb.get_text() {
+        if !txt.is_empty() {
+            let hash = hash_slice(txt.as_bytes());
+            return Some((Message::ClipText(txt, hash), hash));
+        }
+    }
+    if let Ok(img) = cb.get_image() {
+        let mut bytes = img.bytes.into_owned();
+        fix_zero_alpha(&mut bytes);
+        let hash = hash_slice(&bytes);
+        return Some((
+            Message::ClipImage {
+                width: img.width as u32,
+                height: img.height as u32,
+                rgba: Arc::new(bytes),
+                hash,
+            },
+            hash,
+        ));
+    }
+    None
+}
+
+/// Event-driven single-instance focus handoff. A second `clipper` invocation
+/// connects to our Unix socket; the listener thread (see `setup_singleton`)
+/// signals us through `FOCUS_RX` and we forward a focus request. No polling.
+fn focus_worker() -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(4, |output: iced::futures::channel::mpsc::Sender<Message>| async move {
+        let rx = FOCUS_RX
+            .get()
+            .and_then(|m| m.lock().ok().and_then(|mut g| g.take()));
+        if let Some(rx) = rx {
+            std::thread::spawn(move || {
+                let mut output = output;
+                while rx.recv().is_ok() {
+                    match output.try_send(Message::FocusRequested) {
+                        Ok(()) => {}
+                        Err(e) if e.is_disconnected() => return,
+                        Err(_) => {}
+                    }
+                }
+            });
+        }
+    })
+}
+
 fn load_window_icon() -> Result<window::Icon, iced::Error> {
     let png = include_bytes!("../assets/clipper.png");
     let decoder = PngDecoder::new(std::io::Cursor::new(png))
@@ -151,7 +260,6 @@ struct Clipper {
     clips: Vec<Clip>,
     selected: Option<u64>,
     next_id: u64,
-    last_clipboard_hash: Option<u64>,
     settings: Settings,
     storage: Option<Storage>,
     settings_open: bool,
@@ -160,9 +268,9 @@ struct Clipper {
     search_active: bool,
     search_query: String,
     main_window: Option<window::Id>,
-    focus_rx: Option<Receiver<()>>,
-    idle_monitor: Option<IdleMonitor>,
     is_idle: bool,
+    list_offset_y: f32,
+    list_viewport_h: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -170,7 +278,19 @@ enum Message {
     Select(u64),
     Remove(u64),
     CopySelected,
-    Tick,
+    ClipText(String, u64),
+    ClipImage {
+        width: u32,
+        height: u32,
+        rgba: Arc<Vec<u8>>,
+        hash: u64,
+    },
+    IdleChanged(bool),
+    FocusRequested,
+    ListScrolled {
+        offset_y: f32,
+        viewport_h: f32,
+    },
     ToggleSettings,
     SettingsHistorySizeChanged(String),
     SettingsPollIntervalChanged(String),
@@ -239,15 +359,11 @@ impl Clipper {
         let selected = clips.first().map(|c| c.id);
         let draft_history = loaded.settings.history_size.to_string();
         let draft_poll = loaded.settings.poll_interval_ms.to_string();
-        let focus_rx = FOCUS_RX
-            .get()
-            .and_then(|m| m.lock().ok().and_then(|mut g| g.take()));
 
         Self {
             clips,
             selected,
             next_id,
-            last_clipboard_hash: None,
             settings: loaded.settings,
             storage,
             settings_open: false,
@@ -256,9 +372,11 @@ impl Clipper {
             search_active: false,
             search_query: String::new(),
             main_window: None,
-            focus_rx,
-            idle_monitor: IdleMonitor::new(),
             is_idle: false,
+            list_offset_y: 0.0,
+            // Overestimate until the first scroll event reports the real height;
+            // rendering a few extra rows is harmless, rendering too few is not.
+            list_viewport_h: 600.0,
         }
     }
 
@@ -283,17 +401,36 @@ impl Clipper {
                 self.copy_selected();
                 Task::none()
             }
-            Message::Tick => {
-                self.poll_clipboard();
-                if let (Some(rx), Some(id)) = (&self.focus_rx, self.main_window) {
-                    if rx.try_recv().is_ok() {
-                        while rx.try_recv().is_ok() {}
-                        return Task::batch([
-                            window::minimize(id, false),
-                            window::gain_focus(id),
-                        ]);
-                    }
+            Message::ClipText(txt, hash) => {
+                self.ingest_text(txt, hash);
+                Task::none()
+            }
+            Message::ClipImage {
+                width,
+                height,
+                rgba,
+                hash,
+            } => {
+                self.ingest_image(width, height, rgba, hash);
+                Task::none()
+            }
+            Message::IdleChanged(idle) => {
+                self.is_idle = idle;
+                Task::none()
+            }
+            Message::FocusRequested => {
+                if let Some(id) = self.main_window {
+                    Task::batch([window::minimize(id, false), window::gain_focus(id)])
+                } else {
+                    Task::none()
                 }
+            }
+            Message::ListScrolled {
+                offset_y,
+                viewport_h,
+            } => {
+                self.list_offset_y = offset_y;
+                self.list_viewport_h = viewport_h;
                 Task::none()
             }
             Message::WindowOpened(id) => {
@@ -318,13 +455,18 @@ impl Clipper {
                         && self.search_active
                     {
                         self.close_search();
+                        return scroll_to(
+                            LIST_SCROLL_ID.clone(),
+                            AbsoluteOffset { x: 0.0, y: 0.0 },
+                        );
                     }
                 }
                 Task::none()
             }
             Message::SearchChanged(q) => {
                 self.search_query = q;
-                Task::none()
+                self.list_offset_y = 0.0;
+                scroll_to(LIST_SCROLL_ID.clone(), AbsoluteOffset { x: 0.0, y: 0.0 })
             }
             Message::ToggleSettings => {
                 self.settings_open = !self.settings_open;
@@ -358,7 +500,6 @@ impl Clipper {
             Message::SettingsDeleteAll => {
                 self.clips.clear();
                 self.selected = None;
-                self.last_clipboard_hash = None;
                 if let Some(s) = self.storage.as_ref() {
                     let _ = s.delete_all_clips();
                 }
@@ -394,9 +535,15 @@ impl Clipper {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let interval = Duration::from_millis(self.settings.poll_interval_ms as u64);
         Subscription::batch([
-            time::every(interval).map(|_| Message::Tick),
+            // Clipboard polling runs on a background thread and only emits a
+            // message when the clipboard content actually changes, so an idle
+            // session produces no messages — and therefore no redraws.
+            // Keying the subscription on the interval restarts the worker when
+            // the poll interval is changed in settings.
+            Subscription::run_with(self.settings.poll_interval_ms as u64, clipboard_worker),
+            // Single-instance focus handoff, also event-driven (no timer).
+            Subscription::run(focus_worker),
             window::open_events().map(Message::WindowOpened),
             keyboard::listen().map(Message::Key),
         ])
@@ -411,50 +558,6 @@ impl Clipper {
             "Clipper — Clipboard History (idle)".to_string()
         } else {
             "Clipper — Clipboard History".to_string()
-        }
-    }
-
-    fn poll_clipboard(&mut self) {
-        if let Some(mon) = self.idle_monitor.as_ref() {
-            if let Some(ms) = mon.idle_ms() {
-                let idle_now = ms >= IDLE_THRESHOLD_MS;
-                if idle_now != self.is_idle {
-                    self.is_idle = idle_now;
-                    if idle_now {
-                        eprintln!("clipper: idle ({} ms) — pausing clipboard polling", ms);
-                    } else {
-                        eprintln!("clipper: active ({} ms) — resuming clipboard polling", ms);
-                    }
-                }
-                if idle_now {
-                    return;
-                }
-            }
-        }
-
-        let Ok(mut cb) = arboard::Clipboard::new() else {
-            return;
-        };
-
-        if let Ok(txt) = cb.get_text() {
-            if !txt.is_empty() {
-                let hash = hash_slice(txt.as_bytes());
-                if self.last_clipboard_hash != Some(hash) {
-                    self.last_clipboard_hash = Some(hash);
-                    self.ingest_text(txt, hash);
-                }
-                return;
-            }
-        }
-
-        if let Ok(img) = cb.get_image() {
-            let mut bytes = img.bytes.into_owned();
-            fix_zero_alpha(&mut bytes);
-            let hash = hash_slice(&bytes);
-            if self.last_clipboard_hash != Some(hash) {
-                self.last_clipboard_hash = Some(hash);
-                self.ingest_image(img.width as u32, img.height as u32, bytes, hash);
-            }
         }
     }
 
@@ -490,7 +593,7 @@ impl Clipper {
         }
     }
 
-    fn ingest_image(&mut self, width: u32, height: u32, bytes: Vec<u8>, hash: u64) {
+    fn ingest_image(&mut self, width: u32, height: u32, rgba: Arc<Vec<u8>>, hash: u64) {
         if let Some(pos) = self.clips.iter().position(|c| c.hash == hash) {
             self.bump_to_top(pos);
             if let Some(s) = self.storage_if_enabled() {
@@ -506,11 +609,10 @@ impl Clipper {
                 &storage::ClipData::Image {
                     width,
                     height,
-                    rgba: bytes.clone(),
+                    rgba: (*rgba).clone(),
                 },
             );
         }
-        let rgba = Arc::new(bytes);
         let handle = Handle::from_rgba(width, height, (*rgba).clone());
         let preview = format!("image · {}×{}", width, height);
         self.clips.insert(
@@ -573,7 +675,6 @@ impl Clipper {
         let Ok(mut cb) = arboard::Clipboard::new() else {
             return;
         };
-        let hash = self.clips[pos].hash;
         match &self.clips[pos].data {
             ClipData::Text(t) => {
                 let _ = cb.set_text(t.clone());
@@ -591,7 +692,6 @@ impl Clipper {
                 let _ = cb.set_image(img);
             }
         }
-        self.last_clipboard_hash = Some(hash);
         self.bump_to_top(pos);
         if let Some(s) = self.storage_if_enabled() {
             let _ = s.save_order(&self.order_vec());
@@ -603,18 +703,21 @@ impl Clipper {
     }
 
     fn toggle_search(&mut self) -> Task<Message> {
+        self.list_offset_y = 0.0;
+        let reset_scroll = scroll_to(LIST_SCROLL_ID.clone(), AbsoluteOffset { x: 0.0, y: 0.0 });
         if self.search_active {
             self.close_search();
-            Task::none()
+            reset_scroll
         } else {
             self.search_active = true;
-            focus(SEARCH_INPUT_ID.clone())
+            Task::batch([focus(SEARCH_INPUT_ID.clone()), reset_scroll])
         }
     }
 
     fn close_search(&mut self) {
         self.search_active = false;
         self.search_query.clear();
+        self.list_offset_y = 0.0;
     }
 
     fn filtered_clips(&self) -> Vec<&Clip> {
@@ -725,10 +828,32 @@ impl Clipper {
         });
 
         let filtered = self.filtered_clips();
-        let list_items = filtered.iter().fold(column![].spacing(4), |col, clip| {
+        let total = filtered.len();
+
+        // Virtualized list: only build widgets for the rows currently visible
+        // (plus a small overscan). Spacers above and below preserve the full
+        // scroll height so the scrollbar geometry stays correct. Without this,
+        // every redraw built the entire history (up to `history_size` rows),
+        // which is what pegged the CPU.
+        let first_visible = (self.list_offset_y / LIST_ROW_STRIDE).floor().max(0.0) as usize;
+        let window = (self.list_viewport_h / LIST_ROW_STRIDE).ceil() as usize + LIST_OVERSCAN * 2;
+        let start = first_visible.saturating_sub(LIST_OVERSCAN).min(total);
+        let end = (start + window).min(total);
+
+        let mut list_items = column![].spacing(0);
+        if start > 0 {
+            list_items = list_items
+                .push(Space::new().height(Length::Fixed(start as f32 * LIST_ROW_STRIDE)));
+        }
+        for clip in &filtered[start..end] {
             let selected = self.selected == Some(clip.id);
-            col.push(clip_row(clip.id, &clip.preview, selected))
-        });
+            list_items = list_items.push(clip_row(clip.id, &clip.preview, selected));
+        }
+        if end < total {
+            list_items = list_items.push(
+                Space::new().height(Length::Fixed((total - end) as f32 * LIST_ROW_STRIDE)),
+            );
+        }
 
         let mut list_column = column![].spacing(0);
         if self.search_active {
@@ -755,9 +880,17 @@ impl Clipper {
             );
         }
         list_column = list_column.push(
-            scrollable(container(list_items).padding(8))
+            scrollable(container(list_items).padding([0, 8]))
+                .id(LIST_SCROLL_ID.clone())
                 .height(Fill)
-                .width(Fill),
+                .width(Fill)
+                .on_scroll(|vp: Viewport| {
+                    let offset = vp.absolute_offset();
+                    Message::ListScrolled {
+                        offset_y: offset.y,
+                        viewport_h: vp.bounds().height,
+                    }
+                }),
         );
 
         let list_panel = container(list_column)
@@ -1098,14 +1231,16 @@ impl Clipper {
 fn clip_row(id: u64, preview: &str, selected: bool) -> Element<'_, Message> {
     let label = text(preview.to_string())
         .size(14)
-        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+        // Single line: rows must stay a fixed height for list virtualization.
+        // Overlong previews are clipped (see `.clip(true)` below), not wrapped.
+        .wrapping(iced::widget::text::Wrapping::None)
         .color(if selected {
             Color::from_rgb8(0xff, 0xff, 0xff)
         } else {
             Color::from_rgb8(0xc3, 0xc7, 0xd1)
         });
 
-    let select_btn = button(container(label).padding([8, 10]).width(Fill))
+    let select_btn = button(container(label).padding([8, 10]).width(Fill).clip(true))
         .width(Fill)
         .padding(0)
         .on_press(Message::Select(id))
@@ -1170,10 +1305,14 @@ fn clip_row(id: u64, preview: &str, selected: bool) -> Element<'_, Message> {
         }
     });
 
-    row![select_btn, remove_btn]
-        .spacing(4)
-        .align_y(alignment::Vertical::Center)
-        .into()
+    container(
+        row![select_btn, remove_btn]
+            .spacing(4)
+            .align_y(alignment::Vertical::Center),
+    )
+    // Fixed cell height so the list can be virtualized against LIST_ROW_STRIDE.
+    .center_y(Length::Fixed(LIST_ROW_STRIDE))
+    .into()
 }
 
 fn fix_zero_alpha(rgba: &mut [u8]) {
