@@ -1,4 +1,5 @@
 mod idle;
+mod ipc;
 mod storage;
 
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -22,7 +23,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -42,7 +42,14 @@ const LIST_ROW_STRIDE: f32 = 40.0;
 /// Extra rows rendered above/below the visible window to avoid blanks while scrolling.
 const LIST_OVERSCAN: usize = 6;
 
-static FOCUS_RX: OnceLock<Mutex<Option<Receiver<()>>>> = OnceLock::new();
+/// A command received on the control socket, forwarded from the listener thread
+/// into the iced event loop by `ipc_worker`.
+enum IpcCommand {
+    Focus,
+    Note(String),
+}
+
+static IPC_RX: OnceLock<Mutex<Option<Receiver<IpcCommand>>>> = OnceLock::new();
 
 fn main() -> iced::Result {
     if !setup_singleton() {
@@ -67,21 +74,13 @@ fn main() -> iced::Result {
         .run()
 }
 
-fn socket_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(dir).join("clipper.sock");
-    }
-    let user = std::env::var("USER").unwrap_or_else(|_| "default".to_string());
-    PathBuf::from(format!("/tmp/clipper-{user}.sock"))
-}
-
 /// Returns `true` if this process should proceed as the primary instance.
 /// Returns `false` if another instance is already running and was notified to focus.
 fn setup_singleton() -> bool {
-    let sock_path = socket_path();
+    let sock_path = ipc::socket_path();
 
     if let Ok(mut stream) = UnixStream::connect(&sock_path) {
-        let _ = stream.write_all(b"focus\n");
+        let _ = stream.write_all(format!("{}\n", ipc::VERB_FOCUS).as_bytes());
         let _ = stream.flush();
         eprintln!("clipper: another instance is already running; requested focus");
         return false;
@@ -100,15 +99,17 @@ fn setup_singleton() -> bool {
         }
     };
 
-    let (tx, rx) = channel::<()>();
-    let _ = FOCUS_RX.set(Mutex::new(Some(rx)));
+    let (tx, rx) = channel::<IpcCommand>();
+    let _ = IPC_RX.set(Mutex::new(Some(rx)));
 
     std::thread::spawn(move || loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let mut buf = [0u8; 16];
-                let _ = stream.read(&mut buf);
-                if tx.send(()).is_err() {
+                // Clients write a short request and close the write half; read to
+                // EOF so multi-line note bodies arrive intact.
+                let mut buf = Vec::new();
+                let _ = stream.read_to_end(&mut buf);
+                if tx.send(parse_ipc(&buf)).is_err() {
                     break;
                 }
             }
@@ -117,6 +118,22 @@ fn setup_singleton() -> bool {
     });
 
     true
+}
+
+/// Parses a control-socket request: the first line is the verb, everything after
+/// the first newline is the payload. Unknown/empty requests fall back to focus,
+/// preserving the original single-byte focus handshake.
+fn parse_ipc(buf: &[u8]) -> IpcCommand {
+    let text = String::from_utf8_lossy(buf);
+    let (verb, rest) = match text.split_once('\n') {
+        Some((v, r)) => (v.trim(), r),
+        None => (text.trim(), ""),
+    };
+    if verb == ipc::VERB_NOTE {
+        IpcCommand::Note(rest.to_string())
+    } else {
+        IpcCommand::Focus
+    }
 }
 
 /// Background clipboard poller. Runs on its own OS thread and only forwards a
@@ -199,19 +216,23 @@ fn read_clipboard(cb: &mut arboard::Clipboard) -> Option<(Message, u64)> {
     None
 }
 
-/// Event-driven single-instance focus handoff. A second `clipper` invocation
-/// connects to our Unix socket; the listener thread (see `setup_singleton`)
-/// signals us through `FOCUS_RX` and we forward a focus request. No polling.
-fn focus_worker() -> impl iced::futures::Stream<Item = Message> {
+/// Event-driven control-socket handler. The listener thread (see
+/// `setup_singleton`) hands us commands through `IPC_RX`: a second `clipper`
+/// invocation requests focus, and `clipper-note` injects a note. No polling.
+fn ipc_worker() -> impl iced::futures::Stream<Item = Message> {
     iced::stream::channel(4, |output: iced::futures::channel::mpsc::Sender<Message>| async move {
-        let rx = FOCUS_RX
+        let rx = IPC_RX
             .get()
             .and_then(|m| m.lock().ok().and_then(|mut g| g.take()));
         if let Some(rx) = rx {
             std::thread::spawn(move || {
                 let mut output = output;
-                while rx.recv().is_ok() {
-                    match output.try_send(Message::FocusRequested) {
+                while let Ok(cmd) = rx.recv() {
+                    let msg = match cmd {
+                        IpcCommand::Focus => Message::FocusRequested,
+                        IpcCommand::Note(text) => Message::InjectNote(text),
+                    };
+                    match output.try_send(msg) {
                         Ok(()) => {}
                         Err(e) if e.is_disconnected() => return,
                         Err(_) => {}
@@ -254,6 +275,54 @@ struct Clip {
     hash: u64,
     preview: String,
     image_handle: Option<Handle>,
+    /// True for clips injected via `clipper-note`; drives the list row accent.
+    note: bool,
+}
+
+/// Per-row color treatment in the sidebar, derived from the clip's origin/type.
+#[derive(Clone, Copy)]
+enum RowAccent {
+    /// Normal clipboard text — the neutral default.
+    Text,
+    /// AI note injected via `clipper-note` — green tint.
+    Note,
+    /// Image clip — violet tint.
+    Image,
+}
+
+impl RowAccent {
+    /// (idle background, idle border, hover background, hover border).
+    fn surfaces(self) -> (Color, Color, Color, Color) {
+        match self {
+            RowAccent::Text => (
+                Color::from_rgb8(0x1b, 0x1d, 0x23),
+                Color::from_rgb8(0x25, 0x28, 0x31),
+                Color::from_rgb8(0x23, 0x27, 0x30),
+                Color::from_rgb8(0x2e, 0x33, 0x3e),
+            ),
+            RowAccent::Note => (
+                Color::from_rgb8(0x15, 0x24, 0x1f),
+                Color::from_rgb8(0x2c, 0x55, 0x49),
+                Color::from_rgb8(0x1b, 0x30, 0x28),
+                Color::from_rgb8(0x37, 0x6b, 0x5a),
+            ),
+            RowAccent::Image => (
+                Color::from_rgb8(0x1f, 0x1a, 0x29),
+                Color::from_rgb8(0x42, 0x36, 0x60),
+                Color::from_rgb8(0x27, 0x20, 0x36),
+                Color::from_rgb8(0x52, 0x44, 0x78),
+            ),
+        }
+    }
+
+    /// Preview-text color when the row is not selected (selected rows are white).
+    fn label_color(self) -> Color {
+        match self {
+            RowAccent::Text => Color::from_rgb8(0xc3, 0xc7, 0xd1),
+            RowAccent::Note => Color::from_rgb8(0x9c, 0xd9, 0xc4),
+            RowAccent::Image => Color::from_rgb8(0xc6, 0xb6, 0xe6),
+        }
+    }
 }
 
 struct Clipper {
@@ -287,6 +356,7 @@ enum Message {
     },
     IdleChanged(bool),
     FocusRequested,
+    InjectNote(String),
     ListScrolled {
         offset_y: f32,
         viewport_h: f32,
@@ -352,6 +422,7 @@ impl Clipper {
                     hash: pc.hash,
                     preview,
                     image_handle,
+                    note: pc.is_note,
                 }
             })
             .collect();
@@ -424,6 +495,10 @@ impl Clipper {
                 } else {
                     Task::none()
                 }
+            }
+            Message::InjectNote(text) => {
+                self.ingest_note(text);
+                Task::none()
             }
             Message::ListScrolled {
                 offset_y,
@@ -543,7 +618,7 @@ impl Clipper {
             // the poll interval is changed in settings.
             Subscription::run_with(self.settings.poll_interval_ms as u64, clipboard_worker),
             // Single-instance focus handoff, also event-driven (no timer).
-            Subscription::run(focus_worker),
+            Subscription::run(ipc_worker),
             window::open_events().map(Message::WindowOpened),
             keyboard::listen().map(Message::Key),
         ])
@@ -582,8 +657,51 @@ impl Clipper {
                 hash,
                 preview,
                 image_handle: None,
+                note: false,
             },
         );
+        if self.selected.is_none() {
+            self.selected = Some(id);
+        }
+        self.trim();
+        if let Some(s) = self.storage_if_enabled() {
+            let _ = s.save_order(&self.order_vec());
+        }
+    }
+
+    /// Injects an AI note at the top of the list. Unlike a normal copy this never
+    /// touches the system clipboard; the note is hashed in a separate namespace
+    /// so it stays distinct from an identical copied-text clip.
+    fn ingest_note(&mut self, txt: String) {
+        let txt = txt.trim_end_matches('\n').to_string();
+        if txt.is_empty() {
+            return;
+        }
+        let hash = note_hash(&txt);
+        if let Some(pos) = self.clips.iter().position(|c| c.hash == hash) {
+            self.bump_to_top(pos);
+            if let Some(s) = self.storage_if_enabled() {
+                let _ = s.save_order(&self.order_vec());
+            }
+            return;
+        }
+        let preview = preview_text(&txt);
+        let id = self.alloc_id();
+        if let Some(s) = self.storage_if_enabled() {
+            let _ = s.save_note(id, hash, &txt);
+        }
+        self.clips.insert(
+            0,
+            Clip {
+                id,
+                data: ClipData::Text(txt),
+                hash,
+                preview,
+                image_handle: None,
+                note: true,
+            },
+        );
+        // Don't yank the user's current selection; only select if nothing is.
         if self.selected.is_none() {
             self.selected = Some(id);
         }
@@ -627,6 +745,7 @@ impl Clipper {
                 hash,
                 preview,
                 image_handle: Some(handle),
+                note: false,
             },
         );
         if self.selected.is_none() {
@@ -847,7 +966,14 @@ impl Clipper {
         }
         for clip in &filtered[start..end] {
             let selected = self.selected == Some(clip.id);
-            list_items = list_items.push(clip_row(clip.id, &clip.preview, selected));
+            let accent = if clip.note {
+                RowAccent::Note
+            } else if matches!(clip.data, ClipData::Image { .. }) {
+                RowAccent::Image
+            } else {
+                RowAccent::Text
+            };
+            list_items = list_items.push(clip_row(clip.id, &clip.preview, selected, accent));
         }
         if end < total {
             list_items = list_items.push(
@@ -1228,7 +1354,7 @@ impl Clipper {
     }
 }
 
-fn clip_row(id: u64, preview: &str, selected: bool) -> Element<'_, Message> {
+fn clip_row(id: u64, preview: &str, selected: bool, accent: RowAccent) -> Element<'_, Message> {
     let label = text(preview.to_string())
         .size(14)
         // Single line: rows must stay a fixed height for list virtualization.
@@ -1237,7 +1363,7 @@ fn clip_row(id: u64, preview: &str, selected: bool) -> Element<'_, Message> {
         .color(if selected {
             Color::from_rgb8(0xff, 0xff, 0xff)
         } else {
-            Color::from_rgb8(0xc3, 0xc7, 0xd1)
+            accent.label_color()
         });
 
     let select_btn = button(container(label).padding([8, 10]).width(Fill).clip(true))
@@ -1245,19 +1371,14 @@ fn clip_row(id: u64, preview: &str, selected: bool) -> Element<'_, Message> {
         .padding(0)
         .on_press(Message::Select(id))
         .style(move |_theme: &Theme, status| {
+            let (idle_bg, idle_border, hover_bg, hover_border) = accent.surfaces();
             let (bg, border) = match (selected, status) {
                 (true, _) => (
                     Color::from_rgb8(0x3b, 0x5b, 0xa9),
                     Color::from_rgb8(0x5c, 0x82, 0xd6),
                 ),
-                (false, button::Status::Hovered) => (
-                    Color::from_rgb8(0x23, 0x27, 0x30),
-                    Color::from_rgb8(0x2e, 0x33, 0x3e),
-                ),
-                (false, _) => (
-                    Color::from_rgb8(0x1b, 0x1d, 0x23),
-                    Color::from_rgb8(0x25, 0x28, 0x31),
-                ),
+                (false, button::Status::Hovered) => (hover_bg, hover_border),
+                (false, _) => (idle_bg, idle_border),
             };
             button::Style {
                 background: Some(Background::Color(bg)),
@@ -1326,6 +1447,15 @@ fn fix_zero_alpha(rgba: &mut [u8]) {
 fn hash_slice(bytes: &[u8]) -> u64 {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
+    h.finish()
+}
+
+/// Hashes note text in its own namespace so an AI note and an identical copied
+/// text clip don't collide (and dedupe into each other) in the history.
+fn note_hash(text: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    "note\0".hash(&mut h);
+    text.hash(&mut h);
     h.finish()
 }
 

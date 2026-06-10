@@ -8,6 +8,10 @@ const SETTINGS_KEY: &str = "settings";
 
 const TAG_TEXT: u8 = 1;
 const TAG_IMAGE: u8 = 2;
+// Notes injected via `clipper-note`. Same payload layout as TAG_TEXT; a distinct
+// tag lets us round-trip the note origin without changing the existing format,
+// so databases written by older builds still decode.
+const TAG_NOTE: u8 = 3;
 
 pub struct Storage {
     db: Database,
@@ -24,6 +28,9 @@ pub struct PersistedClip {
     pub id: u64,
     pub hash: u64,
     pub data: ClipData,
+    /// True when this clip was injected as an AI note rather than copied from
+    /// the system clipboard. Only ever set for text clips.
+    pub is_note: bool,
 }
 
 #[derive(Debug)]
@@ -97,6 +104,19 @@ impl Storage {
 
     pub fn save_clip(&self, id: u64, hash: u64, data: &ClipData) -> Result<(), redb::Error> {
         let encoded = encode_clip(hash, data);
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(CLIPS)?;
+            table.insert(id, encoded.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Persists an AI note. Stored like a text clip but tagged so it reloads with
+    /// its note origin intact (and renders with the note accent in the list).
+    pub fn save_note(&self, id: u64, hash: u64, text: &str) -> Result<(), redb::Error> {
+        let encoded = encode_note(hash, text);
         let write = self.db.begin_write()?;
         {
             let mut table = write.open_table(CLIPS)?;
@@ -183,6 +203,16 @@ fn encode_clip(hash: u64, data: &ClipData) -> Vec<u8> {
     out
 }
 
+fn encode_note(hash: u64, text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&hash.to_le_bytes());
+    out.push(TAG_NOTE);
+    let bytes = text.as_bytes();
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+    out
+}
+
 fn decode_clip(id: u64, bytes: &[u8]) -> Option<PersistedClip> {
     if bytes.len() < 9 {
         return None;
@@ -190,8 +220,10 @@ fn decode_clip(id: u64, bytes: &[u8]) -> Option<PersistedClip> {
     let hash = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
     let tag = bytes[8];
     let rest = &bytes[9..];
+    let mut is_note = false;
     let data = match tag {
-        TAG_TEXT => {
+        TAG_TEXT | TAG_NOTE => {
+            is_note = tag == TAG_NOTE;
             if rest.len() < 4 {
                 return None;
             }
@@ -221,7 +253,12 @@ fn decode_clip(id: u64, bytes: &[u8]) -> Option<PersistedClip> {
         }
         _ => return None,
     };
-    Some(PersistedClip { id, hash, data })
+    Some(PersistedClip {
+        id,
+        hash,
+        data,
+        is_note,
+    })
 }
 
 fn encode_order(order: &[u64]) -> Vec<u8> {
