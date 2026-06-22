@@ -48,6 +48,7 @@ pub struct Settings {
     pub history_size: u32,
     pub storage_enabled: bool,
     pub poll_interval_ms: u32,
+    pub start_minimized: bool,
 }
 
 impl Default for Settings {
@@ -56,6 +57,7 @@ impl Default for Settings {
             history_size: 1000,
             storage_enabled: true,
             poll_interval_ms: 500,
+            start_minimized: false,
         }
     }
 }
@@ -287,10 +289,11 @@ fn decode_order(bytes: &[u8]) -> Option<Vec<u64>> {
 }
 
 fn encode_settings(s: &Settings) -> Vec<u8> {
-    let mut out = Vec::with_capacity(9);
+    let mut out = Vec::with_capacity(10);
     out.extend_from_slice(&s.history_size.to_le_bytes());
     out.push(if s.storage_enabled { 1 } else { 0 });
     out.extend_from_slice(&s.poll_interval_ms.to_le_bytes());
+    out.push(if s.start_minimized { 1 } else { 0 });
     out
 }
 
@@ -310,9 +313,15 @@ fn decode_settings(bytes: &[u8]) -> Option<Settings> {
     } else {
         defaults.poll_interval_ms
     };
+    let start_minimized = if bytes.len() >= 10 {
+        bytes[9] != 0
+    } else {
+        defaults.start_minimized
+    };
     Some(Settings {
         history_size,
         storage_enabled,
         poll_interval_ms,
+        start_minimized,
     })
 }

@@ -7,11 +7,12 @@
 # tooling, a graphical session, and common runtime libraries before building.
 #
 # Usage:
-#   ./install.sh [--bindir DIR] [--no-desktop] [--skip-build] [-h|--help]
+#   ./install.sh [--bindir DIR] [--no-desktop] [--autostart] [--skip-build] [-h|--help]
 #
 # Options:
 #   --bindir DIR   Where to install the clipper-note CLI (default: ~/.local/bin)
 #   --no-desktop   Skip installing the GUI desktop launcher
+#   --autostart    Launch Clipper (minimized) on login via an XDG autostart entry
 #   --skip-build   Use the existing target/release build instead of rebuilding
 #   -h, --help     Show this help
 
@@ -23,6 +24,7 @@ MIN_RUST="1.88.0"
 BINDIR="${BINDIR:-$HOME/.local/bin}"
 DO_DESKTOP=1
 DO_BUILD=1
+DO_AUTOSTART=0
 
 # ---------- pretty output ----------------------------------------------------
 if [[ -t 1 ]]; then
@@ -42,6 +44,7 @@ while [[ $# -gt 0 ]]; do
         --bindir)     BINDIR="${2:?--bindir needs a path}"; shift 2 ;;
         --bindir=*)   BINDIR="${1#*=}"; shift ;;
         --no-desktop) DO_DESKTOP=0; shift ;;
+        --autostart)  DO_AUTOSTART=1; shift ;;
         --skip-build) DO_BUILD=0; shift ;;
         -h|--help)    awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"; exit 0 ;;
         *)            die "unknown option: $1 (try --help)" ;;
@@ -172,6 +175,35 @@ if [[ "$DO_DESKTOP" -eq 1 ]]; then
     fi
 else
     info "Skipping desktop launcher (--no-desktop)"
+fi
+
+# ---------- install login autostart -----------------------------------------
+if [[ "$DO_AUTOSTART" -eq 1 ]]; then
+    info "Installing login autostart entry"
+    AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+    AUTOSTART="$AUTOSTART_DIR/clipper.desktop"
+    ICON="$SCRIPT_DIR/assets/clipper.png"
+    mkdir -p "$AUTOSTART_DIR"
+    # Launch minimized at login regardless of the in-app setting, so the window
+    # never grabs focus on boot. The in-app "Launch minimized" toggle still
+    # governs manual launches.
+    cat > "$AUTOSTART" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Clipper
+GenericName=Clipboard History
+Comment=Clipboard history with text and image support
+Exec=$CLIPPER_BIN --minimized
+Icon=$ICON
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+StartupWMClass=clipper
+X-GNOME-Autostart-enabled=true
+EOF
+    ok "Installed $AUTOSTART (launches minimized on login)"
+else
+    info "Skipping login autostart (pass --autostart to enable)"
 fi
 
 # ---------- summary ----------------------------------------------------------

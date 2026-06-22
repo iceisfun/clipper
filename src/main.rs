@@ -51,7 +51,34 @@ enum IpcCommand {
 
 static IPC_RX: OnceLock<Mutex<Option<Receiver<IpcCommand>>>> = OnceLock::new();
 
+/// Set from `--minimized`/`--start-minimized` on the command line. When true the
+/// main window is minimized the first time it opens, so Clipper can run from a
+/// login autostart entry without grabbing focus on every boot.
+static START_MINIMIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn main() -> iced::Result {
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--minimized" | "--start-minimized" => {
+                START_MINIMIZED.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            "-h" | "--help" => {
+                println!(
+                    "clipper — clipboard history\n\n\
+                     Usage: clipper [OPTIONS]\n\n\
+                     Options:\n\
+                     \x20 --minimized, --start-minimized   Start with the window minimized\n\
+                     \x20 -h, --help                        Show this help"
+                );
+                return Ok(());
+            }
+            other => {
+                eprintln!("clipper: unknown option: {other} (try --help)");
+                std::process::exit(2);
+            }
+        }
+    }
+
     if !setup_singleton() {
         return Ok(());
     }
@@ -365,6 +392,7 @@ enum Message {
     SettingsHistorySizeChanged(String),
     SettingsPollIntervalChanged(String),
     SettingsDiskToggled(bool),
+    SettingsMinimizedToggled(bool),
     SettingsDeleteAll,
     SettingsSave,
     WindowOpened(window::Id),
@@ -511,6 +539,11 @@ impl Clipper {
             Message::WindowOpened(id) => {
                 if self.main_window.is_none() {
                     self.main_window = Some(id);
+                    let minimized = self.settings.start_minimized
+                        || START_MINIMIZED.load(std::sync::atomic::Ordering::Relaxed);
+                    if minimized {
+                        return window::minimize(id, true);
+                    }
                 }
                 Task::none()
             }
@@ -569,6 +602,13 @@ impl Clipper {
                 }
                 if enabled && !was_enabled {
                     self.flush_all_to_disk();
+                }
+                Task::none()
+            }
+            Message::SettingsMinimizedToggled(enabled) => {
+                self.settings.start_minimized = enabled;
+                if let Some(s) = self.storage.as_ref() {
+                    let _ = s.save_settings(&self.settings);
                 }
                 Task::none()
             }
@@ -1277,6 +1317,23 @@ impl Clipper {
             .size(12)
             .color(Color::from_rgb8(0x7a, 0x80, 0x8e));
 
+        let minimized_row = row![
+            text("Launch minimized")
+                .size(14)
+                .color(Color::from_rgb8(0xc3, 0xc7, 0xd1))
+                .width(Length::Fixed(130.0)),
+            toggler(self.settings.start_minimized)
+                .on_toggle(Message::SettingsMinimizedToggled)
+                .size(22),
+        ]
+        .align_y(alignment::Vertical::Center)
+        .spacing(10);
+
+        let minimized_hint =
+            text("Start with the window minimized — handy when Clipper runs on login.")
+                .size(12)
+                .color(Color::from_rgb8(0x7a, 0x80, 0x8e));
+
         let delete_all_btn = button(
             container(
                 text("Delete All")
@@ -1328,6 +1385,10 @@ impl Clipper {
                     disk_row,
                     Space::new().height(Length::Fixed(4.0)),
                     disk_hint,
+                    Space::new().height(Length::Fixed(20.0)),
+                    minimized_row,
+                    Space::new().height(Length::Fixed(4.0)),
+                    minimized_hint,
                     Space::new().height(Length::Fixed(24.0)),
                     row![save_btn, cancel_btn].spacing(10),
                     Space::new().height(Length::Fixed(32.0)),
