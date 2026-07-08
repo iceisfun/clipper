@@ -16,8 +16,8 @@ use iced::{
     alignment, window, Background, Border, Color, Element, Fill, Length, Shadow, Subscription,
     Task, Theme,
 };
-use image::codecs::png::PngDecoder;
-use image::ImageDecoder;
+use image::codecs::png::{PngDecoder, PngEncoder};
+use image::{ExtendedColorType, ImageDecoder, ImageEncoder};
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -285,6 +285,44 @@ fn load_window_icon() -> Result<window::Icon, iced::Error> {
         .map_err(|err| iced::Error::WindowCreationFailed(Box::new(err)))
 }
 
+/// Runs a native "Save As" dialog and writes the clip to the chosen path.
+/// Returns `Ok(Some(path))` on success, or `Ok(None)` if the user cancelled.
+async fn save_clip_as(data: ClipData) -> Result<Option<String>, String> {
+    let (default_name, filter_name, extensions): (&str, &str, &[&str]) = match &data {
+        ClipData::Text(_) => ("clip.txt", "Text", &["txt"]),
+        ClipData::Image { .. } => ("clip.png", "PNG image", &["png"]),
+    };
+
+    let handle = rfd::AsyncFileDialog::new()
+        .set_file_name(default_name)
+        .add_filter(filter_name, extensions)
+        .save_file()
+        .await;
+
+    let Some(handle) = handle else {
+        return Ok(None);
+    };
+    let path = handle.path().to_path_buf();
+
+    match data {
+        ClipData::Text(t) => {
+            std::fs::write(&path, t).map_err(|e| e.to_string())?;
+        }
+        ClipData::Image {
+            width,
+            height,
+            rgba,
+        } => {
+            let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+            PngEncoder::new(std::io::BufWriter::new(file))
+                .write_image(rgba.as_slice(), width, height, ExtendedColorType::Rgba8)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(Some(path.display().to_string()))
+}
+
 #[derive(Debug, Clone)]
 enum ClipData {
     Text(String),
@@ -374,6 +412,8 @@ enum Message {
     Select(u64),
     Remove(u64),
     CopySelected,
+    SaveAsSelected,
+    SaveComplete(Result<Option<String>, String>),
     ClipText(String, u64),
     ClipImage {
         width: u32,
@@ -498,6 +538,25 @@ impl Clipper {
             }
             Message::CopySelected => {
                 self.copy_selected();
+                Task::none()
+            }
+            Message::SaveAsSelected => {
+                match self
+                    .selected
+                    .and_then(|id| self.clips.iter().find(|c| c.id == id))
+                {
+                    Some(clip) => {
+                        Task::perform(save_clip_as(clip.data.clone()), Message::SaveComplete)
+                    }
+                    None => Task::none(),
+                }
+            }
+            Message::SaveComplete(result) => {
+                match result {
+                    Ok(Some(path)) => eprintln!("clipper: saved to {path}"),
+                    Ok(None) => {} // user cancelled the dialog
+                    Err(err) => eprintln!("clipper: save failed: {err}"),
+                }
                 Task::none()
             }
             Message::ClipText(txt, hash) => {
@@ -1174,11 +1233,46 @@ impl Clipper {
             }
         });
 
+        let save_as_btn = button(
+            container(
+                text("Save As")
+                    .size(13)
+                    .color(Color::from_rgb8(0xe6, 0xe8, 0xef)),
+            )
+            .padding([6, 14]),
+        )
+        .padding(0)
+        .on_press_maybe(selected_clip.map(|_| Message::SaveAsSelected))
+        .style(|_theme: &Theme, status| {
+            let bg = match status {
+                button::Status::Hovered => Color::from_rgb8(0x3a, 0x41, 0x50),
+                button::Status::Pressed => Color::from_rgb8(0x30, 0x36, 0x43),
+                button::Status::Disabled => Color::from_rgb8(0x23, 0x27, 0x30),
+                _ => Color::from_rgb8(0x2c, 0x31, 0x3d),
+            };
+            let border = match status {
+                button::Status::Disabled => Color::from_rgb8(0x2e, 0x33, 0x3e),
+                _ => Color::from_rgb8(0x4a, 0x51, 0x61),
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: Color::WHITE,
+                border: Border {
+                    color: border,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                shadow: Shadow::default(),
+                ..button::Style::default()
+            }
+        });
+
         let content_header = row![
             text(meta)
                 .size(12)
                 .color(Color::from_rgb8(0x7a, 0x80, 0x8e)),
             Space::new().width(Fill),
+            save_as_btn,
             copy_btn,
         ]
         .align_y(alignment::Vertical::Center)
