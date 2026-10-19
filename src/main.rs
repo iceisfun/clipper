@@ -9,8 +9,8 @@ use iced::widget::image::Handle;
 use iced::widget::operation::{focus, scroll_to};
 use iced::widget::scrollable::{AbsoluteOffset, Viewport};
 use iced::widget::{
-    button, column, container, image as image_widget, row, scrollable, text, text_input, toggler,
-    Space,
+    button, column, container, image as image_widget, opaque, row, scrollable, stack, text,
+    text_input, toggler, Space,
 };
 use iced::{
     alignment, window, Background, Border, Color, Element, Fill, Length, Shadow, Subscription,
@@ -33,6 +33,7 @@ use storage::{LoadedState, Settings, Storage};
 const CONTENT_SCROLL_ID: iced::widget::Id = iced::widget::Id::new("content");
 const LIST_SCROLL_ID: iced::widget::Id = iced::widget::Id::new("list");
 const SEARCH_INPUT_ID: iced::widget::Id = iced::widget::Id::new("search");
+const JUMP_INPUT_ID: iced::widget::Id = iced::widget::Id::new("jump");
 const POLL_INTERVAL_MIN_MS: u32 = 100;
 const POLL_INTERVAL_MAX_MS: u32 = 10_000;
 const IDLE_THRESHOLD_MS: u32 = 30_000;
@@ -401,6 +402,9 @@ struct Clipper {
     settings_draft_poll_interval_ms: String,
     search_active: bool,
     search_query: String,
+    jump_active: bool,
+    jump_query: String,
+    jump_error: bool,
     main_window: Option<window::Id>,
     is_idle: bool,
     list_offset_y: f32,
@@ -438,6 +442,9 @@ enum Message {
     WindowOpened(window::Id),
     Key(keyboard::Event),
     SearchChanged(String),
+    SearchDismiss,
+    JumpQueryChanged(String),
+    JumpSubmit,
 }
 
 impl Clipper {
@@ -510,6 +517,9 @@ impl Clipper {
             settings_draft_poll_interval_ms: draft_poll,
             search_active: false,
             search_query: String::new(),
+            jump_active: false,
+            jump_query: String::new(),
+            jump_error: false,
             main_window: None,
             is_idle: false,
             list_offset_y: 0.0,
@@ -616,16 +626,23 @@ impl Clipper {
                             if c.as_str().eq_ignore_ascii_case("f") {
                                 return self.toggle_search();
                             }
+                            if c.as_str().eq_ignore_ascii_case("k") {
+                                return self.toggle_jump();
+                            }
                         }
                     }
-                    if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
-                        && self.search_active
-                    {
-                        self.close_search();
-                        return scroll_to(
-                            LIST_SCROLL_ID.clone(),
-                            AbsoluteOffset { x: 0.0, y: 0.0 },
-                        );
+                    if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                        if self.jump_active {
+                            self.close_jump();
+                            return Task::none();
+                        }
+                        if self.search_active {
+                            self.close_search();
+                            return scroll_to(
+                                LIST_SCROLL_ID.clone(),
+                                AbsoluteOffset { x: 0.0, y: 0.0 },
+                            );
+                        }
                     }
                 }
                 Task::none()
@@ -634,6 +651,54 @@ impl Clipper {
                 self.search_query = q;
                 self.list_offset_y = 0.0;
                 scroll_to(LIST_SCROLL_ID.clone(), AbsoluteOffset { x: 0.0, y: 0.0 })
+            }
+            Message::SearchDismiss => {
+                // Unlike Escape (which resets to the top of the full list), this
+                // leaves the just-picked result selected and scrolls the now
+                // unfiltered list to wherever that clip actually sits.
+                self.search_active = false;
+                self.search_query.clear();
+                match self.selected.and_then(|id| self.clips.iter().position(|c| c.id == id)) {
+                    Some(index) => {
+                        let row_y = index as f32 * LIST_ROW_STRIDE;
+                        scroll_to(LIST_SCROLL_ID.clone(), AbsoluteOffset { x: 0.0, y: row_y })
+                    }
+                    None => {
+                        self.list_offset_y = 0.0;
+                        scroll_to(LIST_SCROLL_ID.clone(), AbsoluteOffset { x: 0.0, y: 0.0 })
+                    }
+                }
+            }
+            Message::JumpQueryChanged(q) => {
+                // Clip ids, so keep only digits; a pasted/typed stray char shouldn't
+                // block the parse on submit.
+                self.jump_query = q.chars().filter(|c| c.is_ascii_digit()).collect();
+                self.jump_error = false;
+                Task::none()
+            }
+            Message::JumpSubmit => {
+                let Ok(target) = self.jump_query.trim().parse::<u64>() else {
+                    self.jump_error = true;
+                    return Task::none();
+                };
+                match self.clips.iter().position(|c| c.id == target) {
+                    Some(index) => {
+                        self.close_jump();
+                        self.selected = Some(target);
+                        let row_y = index as f32 * LIST_ROW_STRIDE;
+                        Task::batch([
+                            scroll_to(LIST_SCROLL_ID.clone(), AbsoluteOffset { x: 0.0, y: row_y }),
+                            scroll_to(
+                                CONTENT_SCROLL_ID.clone(),
+                                AbsoluteOffset { x: 0.0, y: 0.0 },
+                            ),
+                        ])
+                    }
+                    None => {
+                        self.jump_error = true;
+                        Task::none()
+                    }
+                }
             }
             Message::ToggleSettings => {
                 self.settings_open = !self.settings_open;
@@ -938,6 +1003,27 @@ impl Clipper {
         self.list_offset_y = 0.0;
     }
 
+    /// Ctrl+K: jump straight to a clip by its numeric id. Meant for cases search
+    /// can't help with — e.g. you only know the id, or typing a short number beats
+    /// typing a search phrase (handy over a mobile/remote session).
+    fn toggle_jump(&mut self) -> Task<Message> {
+        if self.jump_active {
+            self.close_jump();
+            Task::none()
+        } else {
+            self.jump_active = true;
+            self.jump_query.clear();
+            self.jump_error = false;
+            focus(JUMP_INPUT_ID.clone())
+        }
+    }
+
+    fn close_jump(&mut self) {
+        self.jump_active = false;
+        self.jump_query.clear();
+        self.jump_error = false;
+    }
+
     fn filtered_clips(&self) -> Vec<&Clip> {
         let q = self.search_query.trim();
         if !self.search_active || q.is_empty() {
@@ -1087,21 +1173,53 @@ impl Clipper {
                 .on_input(Message::SearchChanged)
                 .padding(8)
                 .size(14);
+
+            // Dismisses search while keeping whatever result you clicked focused
+            // in the (now unfiltered) list, instead of snapping back to the top.
+            let dismiss_btn = button(
+                container(text("✕").size(13).color(Color::from_rgb8(0xc3, 0xc7, 0xd1)))
+                    .padding([2, 8]),
+            )
+            .padding(0)
+            .on_press(Message::SearchDismiss)
+            .style(|_theme: &Theme, status| {
+                let bg = match status {
+                    button::Status::Hovered => Color::from_rgb8(0x2a, 0x2e, 0x38),
+                    button::Status::Pressed => Color::from_rgb8(0x20, 0x24, 0x2c),
+                    _ => Color::from_rgb8(0x22, 0x25, 0x2c),
+                };
+                button::Style {
+                    background: Some(Background::Color(bg)),
+                    text_color: Color::WHITE,
+                    border: Border {
+                        color: Color::from_rgb8(0x2e, 0x33, 0x3e),
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    shadow: Shadow::default(),
+                    ..button::Style::default()
+                }
+            });
+
             list_column = list_column.push(
-                container(search_input)
-                    .padding(8)
-                    .width(Fill)
-                    .style(|_: &Theme| container::Style {
-                        background: Some(Background::Color(Color::from_rgb8(
-                            0x1a, 0x1c, 0x22,
-                        ))),
-                        border: Border {
-                            color: Color::from_rgb8(0x24, 0x27, 0x2f),
-                            width: 0.0,
-                            radius: 0.0.into(),
-                        },
-                        ..container::Style::default()
-                    }),
+                container(
+                    row![search_input, dismiss_btn]
+                        .spacing(6)
+                        .align_y(alignment::Vertical::Center),
+                )
+                .padding(8)
+                .width(Fill)
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(Color::from_rgb8(
+                        0x1a, 0x1c, 0x22,
+                    ))),
+                    border: Border {
+                        color: Color::from_rgb8(0x24, 0x27, 0x2f),
+                        width: 0.0,
+                        radius: 0.0.into(),
+                    },
+                    ..container::Style::default()
+                }),
             );
         }
         list_column = list_column.push(
@@ -1138,7 +1256,14 @@ impl Clipper {
         };
 
         let body = row![list_panel, right_panel].height(Fill);
-        column![header, body].width(Fill).height(Fill).into()
+        let base: Element<'_, Message> =
+            column![header, body].width(Fill).height(Fill).into();
+
+        if self.jump_active {
+            stack![base, opaque(self.jump_palette())].into()
+        } else {
+            base
+        }
     }
 
     fn content_panel(&self) -> Element<'_, Message> {
@@ -1293,6 +1418,55 @@ impl Clipper {
             ..container::Style::default()
         })
         .into()
+    }
+
+    /// Ctrl+K palette: type a clip id, hit Enter, land on it in the list.
+    fn jump_palette(&self) -> Element<'_, Message> {
+        let input = text_input("Jump to clip id…", &self.jump_query)
+            .id(JUMP_INPUT_ID.clone())
+            .on_input(Message::JumpQueryChanged)
+            .on_submit(Message::JumpSubmit)
+            .padding(10)
+            .size(16);
+
+        let mut panel = column![
+            text("Jump to clip").size(14).color(Color::from_rgb8(0x9a, 0xa0, 0xad)),
+            input,
+        ]
+        .spacing(8)
+        .width(Length::Fixed(280.0));
+
+        if self.jump_error {
+            panel = panel.push(
+                text("No clip with that id").size(12).color(Color::from_rgb8(0xe0, 0x7a, 0x7a)),
+            );
+        }
+
+        let card = container(panel)
+            .padding(16)
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(Color::from_rgb8(0x1e, 0x21, 0x28))),
+                border: Border {
+                    color: Color::from_rgb8(0x3a, 0x3f, 0x4c),
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..container::Style::default()
+            });
+
+        container(card)
+            .width(Fill)
+            .height(Fill)
+            .align_x(alignment::Horizontal::Center)
+            .padding([80, 0])
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(Color {
+                    a: 0.55,
+                    ..Color::BLACK
+                })),
+                ..container::Style::default()
+            })
+            .into()
     }
 
     fn settings_view(&self) -> Element<'_, Message> {
